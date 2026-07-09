@@ -343,6 +343,7 @@ def _ms_model_path(org, name):
     for sub in (
         MODELS_DIR / "modelscope" / org / name,
         MODELS_DIR / "modelscope" / "hub" / "models" / org / name,
+        MODELS_DIR / "modelscope" / "models" / f"{org}--{name}" / "snapshots" / "master",
     ):
         if sub.exists():
             return sub

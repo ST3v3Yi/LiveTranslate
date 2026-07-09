@@ -35,7 +35,7 @@ class FunASRNanoEngine:
         model = local or model_name
 
         if local:
-            self._ensure_qwen_weights(local)
+            self._ensure_qwen_weights(local, hub=hub)
             neutralize_funasr_requirements(local)
 
         prev_cwd = os.getcwd()
@@ -55,14 +55,17 @@ class FunASRNanoEngine:
         log.info(f"{engine_type} loaded: {model_name} on {device} (hub={hub})")
 
     @staticmethod
-    def _ensure_qwen_weights(model_dir: str):
+    def _ensure_qwen_weights(model_dir: str, hub="ms"):
         qwen_dir = os.path.join(model_dir, "Qwen3-0.6B")
         if not os.path.isdir(qwen_dir):
             return
         if any(f.endswith((".safetensors", ".bin")) for f in os.listdir(qwen_dir)):
             return
         log.info("Downloading Qwen3-0.6B weights (one-time)...")
-        from huggingface_hub import snapshot_download
+        if hub == 'hf':
+            from huggingface_hub import snapshot_download
+        elif hub == 'ms':
+            from modelscope import snapshot_download
 
         snapshot_download(
             "Qwen/Qwen3-0.6B",
