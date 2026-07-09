@@ -89,7 +89,8 @@ FUNASR_MODEL_PROFILES = {
         "legacy_engine": "funasr-nano",
         "modelscope_id": "FunAudioLLM/Fun-ASR-Nano-2512",
         "huggingface_id": "FunAudioLLM/Fun-ASR-Nano-2512",
-        "estimated_bytes": 1_050_000_000,
+        # includes the separately-fetched Qwen3-0.6B weights (~1.5GB)
+        "estimated_bytes": 3_500_000_000,
         "supports_padding": False,
         "supports_language": True,
     },
@@ -99,7 +100,8 @@ FUNASR_MODEL_PROFILES = {
         "legacy_engine": "funasr-mlt-nano",
         "modelscope_id": "FunAudioLLM/Fun-ASR-MLT-Nano-2512",
         "huggingface_id": "FunAudioLLM/Fun-ASR-MLT-Nano-2512",
-        "estimated_bytes": 1_050_000_000,
+        # includes the separately-fetched Qwen3-0.6B weights (~1.5GB)
+        "estimated_bytes": 3_500_000_000,
         "supports_padding": False,
         "supports_language": True,
     },
@@ -390,12 +392,19 @@ def is_asr_cached(engine_type, model_size="medium", hub="ms") -> bool:
         # Accept cache from either hub to avoid redundant downloads; the repo
         # namespace can differ between ModelScope and HuggingFace (SenseVoice).
         ms_org, ms_name = funasr_model_id(model_key, "ms").split("/")
-        if _ms_model_path(ms_org, ms_name).exists():
-            return True
         hf_org, hf_name = funasr_model_id(model_key, "hf").split("/")
-        if _hf_repo_complete(hf_org, hf_name):
-            return True
-        return False
+        if not (
+            _ms_model_path(ms_org, ms_name).exists()
+            or _hf_repo_complete(hf_org, hf_name)
+        ):
+            return False
+        # Nano's Qwen3-0.6B weights download separately; require them so the
+        # download flow (not the deadline-bound worker) pulls them up-front.
+        if funasr_profile(model_key)["family"] == "funasr-nano":
+            model_dir = get_local_model_path(engine_type, hub, funasr_model=model_size)
+            if not model_dir or not qwen_weights_present(model_dir):
+                return False
+        return True
     if engine_type == "anime-whisper":
         # HF-only (not published to ModelScope). Check that snapshots dir actually
         # contains weight files; an .incomplete blob means a prior run aborted mid-download.
@@ -563,6 +572,43 @@ def _load_silero_relaxed_ssl():
         ssl._create_default_https_context = original
 
 
+def qwen_weights_present(model_dir) -> bool:
+    """Whether a nano model's embedded Qwen3-0.6B weights are in place.
+
+    Nano repos ship the Qwen3-0.6B config but not its weights. A variant without
+    the subdir needs no Qwen weights, so absence of the subdir counts as present.
+    """
+    qwen_dir = Path(model_dir) / "Qwen3-0.6B"
+    if not qwen_dir.is_dir():
+        return True
+    return any(f.suffix in (".safetensors", ".bin") for f in qwen_dir.iterdir())
+
+
+def ensure_qwen_weights(model_dir, hub: str = "ms") -> None:
+    """Fetch Qwen3-0.6B weights into a nano model's embedded subdir (one-time).
+
+    Kept off the ASR worker startup path: its 180s ready timeout would otherwise
+    kill the process mid-download on slow links.
+    """
+    qwen_dir = Path(model_dir) / "Qwen3-0.6B"
+    if not qwen_dir.is_dir():
+        return
+    if any(f.suffix in (".safetensors", ".bin") for f in qwen_dir.iterdir()):
+        return
+    log.info("Downloading Qwen3-0.6B weights (one-time)...")
+    if hub == "hf":
+        from huggingface_hub import snapshot_download
+    else:
+        from modelscope import snapshot_download
+
+    snapshot_download(
+        "Qwen/Qwen3-0.6B",
+        local_dir=str(qwen_dir),
+        ignore_patterns=["*.gguf"],
+    )
+    log.info("Qwen3-0.6B weights downloaded")
+
+
 def download_asr(engine, model_size="medium", hub="ms", proxy="system"):
     resolved = str(MODELS_DIR.resolve())
     ms_cache = os.path.join(resolved, "modelscope")
@@ -586,9 +632,10 @@ def download_asr(engine, model_size="medium", hub="ms", proxy="system"):
                 model_id = funasr_model_id(model_key, "hf")
                 log.info(f"Downloading {model_id} from HuggingFace...")
                 snapshot_download(repo_id=model_id, cache_dir=hf_cache)
-            neutralize_funasr_requirements(
-                get_local_model_path("funasr", hub=hub, funasr_model=model_key)
-            )
+            funasr_dir = get_local_model_path("funasr", hub=hub, funasr_model=model_key)
+            neutralize_funasr_requirements(funasr_dir)
+            if funasr_dir and funasr_profile(model_key)["family"] == "funasr-nano":
+                ensure_qwen_weights(funasr_dir, hub=hub)
         elif engine == "anime-whisper":
             # HF-only, ignore hub setting
             from huggingface_hub import snapshot_download
