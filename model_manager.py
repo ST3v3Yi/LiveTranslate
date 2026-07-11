@@ -341,15 +341,30 @@ def is_silero_cached() -> bool:
 
 
 def _ms_model_path(org, name):
-    """Return the first existing ModelScope cache path, or the default."""
+    """Return the first existing ModelScope cache path, or the default.
+
+    Layouts by SDK version: {org}/{name} = <=1.37 with explicit cache_dir;
+    models/{org}/{name} = 1.34~1.37 env-default cache, which >=1.38 keeps
+    reusing as legacy even when cache_dir is passed (dots in names written
+    as ___ by old SDKs); hub trees = older SDKs; models/{org}--{name}/
+    snapshots/{revision} = >=1.38 fresh cache.
+    """
+    ms_root = MODELS_DIR / "modelscope"
     for sub in (
-        MODELS_DIR / "modelscope" / org / name,
-        MODELS_DIR / "modelscope" / "hub" / "models" / org / name,
-        MODELS_DIR / "modelscope" / "models" / f"{org}--{name}" / "snapshots" / "master",
+        ms_root / org / name,
+        ms_root / "models" / org / name,
+        ms_root / "models" / org / name.replace(".", "___"),
+        ms_root / "hub" / "models" / org / name,
+        ms_root / "hub" / org / name,
     ):
         if sub.exists():
             return sub
-    return MODELS_DIR / "modelscope" / org / name
+    snap_root = ms_root / "models" / f"{org}--{name}" / "snapshots"
+    if snap_root.is_dir():
+        snaps = sorted(d for d in snap_root.iterdir() if d.is_dir())
+        if snaps:
+            return snaps[-1]
+    return ms_root / org / name
 
 
 def _hf_repo_complete(org: str, name: str, min_bytes: int = 50_000_000) -> bool:
