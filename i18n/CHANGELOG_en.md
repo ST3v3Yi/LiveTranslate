@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-07-11
+- Fixed Fun-ASR-Nano first load: the Qwen3-0.6B weight download could be killed by the 180s worker startup timeout (#32); weights are now fetched up-front in the model download phase, so worker startup no longer waits on large downloads
+- Fixed model detection misses caused by the ModelScope 1.38+ cache location change (#32, #33): all cache layouts across SDK versions are recognized, so upgrading the SDK no longer re-downloads existing models
+- Qwen3-0.6B weights can now be downloaded from ModelScope; ModelScope-hub users are no longer forced through HuggingFace (#33)
+
 ## 2026-06-20
 - New "Remote Whisper" ASR engine: offload speech recognition to a separate GPU machine (ships `asr_server.py` server), so a box without a GPU can still transcribe in real time
 - New "WebID / ID Verify" translation prompt preset, tuned for video identity-verification calls
