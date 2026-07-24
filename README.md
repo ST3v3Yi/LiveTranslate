@@ -81,13 +81,10 @@ pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu   
 
 # Dependencies
 pip install -r requirements.txt
-pip install funasr --no-deps
 
 # Launch
 .venv\Scripts\python.exe main.py
 ```
-
-> FunASR uses `--no-deps` because `editdistance` requires a C++ compiler. `editdistance-s` in `requirements.txt` is a pure-Python drop-in replacement.
 
 </details>
 

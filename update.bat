@@ -59,10 +59,11 @@ echo.
 echo Updating dependencies...
 .venv\Scripts\pip.exe install -r requirements.txt --quiet
 if errorlevel 1 (
-    echo [WARN] Some dependencies failed to update.
+    echo [ERROR] Failed to update dependencies.
+    pause
+    exit /b 1
 )
 
-.venv\Scripts\pip.exe install funasr --no-deps --quiet
 .venv\Scripts\pip.exe install pysbd --quiet
 
 echo.

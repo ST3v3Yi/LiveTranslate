@@ -81,13 +81,10 @@ pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu   
 
 # 依赖
 pip install -r requirements.txt
-pip install funasr --no-deps
 
 # 启动
 .venv\Scripts\python.exe main.py
 ```
-
-> FunASR 使用 `--no-deps` 安装，因为 `editdistance` 需要 C++ 编译器。`requirements.txt` 中已包含纯 Python 替代品 `editdistance-s`。
 
 </details>
 

@@ -265,17 +265,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Ok "Dependencies installed"
 
-# ── Step 6: Install FunASR (no-deps) ──
-Write-Step "Installing FunASR (--no-deps)..."
-
-& $Pip install funasr --no-deps
-if ($LASTEXITCODE -ne 0) {
-    Write-Warn "FunASR installation failed (non-critical, SenseVoice engine may not work)"
-} else {
-    Write-Ok "FunASR installed"
-}
-
-# ── Step 7: Install pysbd for incremental ASR ──
+# ── Step 6: Install pysbd for incremental ASR ──
 Write-Step "Installing pysbd..."
 
 & $Pip install pysbd
