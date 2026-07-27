@@ -147,7 +147,6 @@ Write-Host "Installing dependencies..." -ForegroundColor Cyan
 & $Uv pip install --python $Py -r requirements.txt
 if ($LASTEXITCODE -ne 0) { Write-Host "Dependency install failed" -ForegroundColor Red; exit 1 }
 
-& $Uv pip install --python $Py funasr --no-deps
 & $Uv pip install --python $Py pysbd
 
 Write-Host "Setup complete." -ForegroundColor Green
