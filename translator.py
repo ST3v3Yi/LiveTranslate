@@ -129,6 +129,13 @@ _OVERRIDE_KEYS = (
 )
 
 
+def _uses_deepseek_thinking_control(api_base, model):
+    """Whether this endpoint/model uses DeepSeek's nested thinking toggle."""
+    endpoint = str(api_base or "").lower()
+    model_id = str(model or "").lower()
+    return "deepseek" in model_id or "api.deepseek.com" in endpoint
+
+
 class Translator:
     """LLM-based translation using OpenAI-compatible API."""
 
@@ -153,9 +160,19 @@ class Translator:
         self._client = make_openai_client(api_base, api_key, proxy, timeout=timeout)
         self._no_system_role = no_system_role
         self._no_think = no_think
+        self._uses_deepseek_thinking = _uses_deepseek_thinking_control(
+            api_base, model
+        )
         self._json_response = json_response
         if no_think:
-            log.info(f"Translator: no_think enabled for {model}")
+            thinking_param = (
+                "thinking.type=disabled"
+                if self._uses_deepseek_thinking
+                else "enable_thinking=false"
+            )
+            log.info(
+                f"Translator: no_think enabled for {model} via {thinking_param}"
+            )
         if json_response:
             log.info(f"Translator: json_response enabled for {model}")
         self._model = model
@@ -212,6 +229,7 @@ class Translator:
         t._client = self._client
         t._no_system_role = self._no_system_role
         t._no_think = self._no_think
+        t._uses_deepseek_thinking = self._uses_deepseek_thinking
         t._json_response = self._json_response
         t._model = self._model
         t._target_language = target_language
@@ -280,7 +298,10 @@ class Translator:
                 kwargs[k] = self._overrides[k]
         extra_body = {}
         if self._no_think:
-            extra_body["enable_thinking"] = False
+            if self._uses_deepseek_thinking:
+                extra_body["thinking"] = {"type": "disabled"}
+            else:
+                extra_body["enable_thinking"] = False
         if self._extra_body:
             extra_body.update(self._extra_body)
         if extra_body:

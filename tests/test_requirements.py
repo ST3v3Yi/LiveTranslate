@@ -26,6 +26,13 @@ def test_funasr_uses_published_dependency_metadata():
     assert "editdistance-s>=1.0.0" not in requirements
 
 
+def test_numpy_numba_versions_support_python_312_resolution():
+    requirements = _requirement_lines()
+
+    assert "numpy>=1.24.0,<2.3" in requirements
+    assert "numba>=0.59.0" in requirements
+
+
 @pytest.mark.parametrize("path", INSTALL_ENTRYPOINTS)
 def test_install_entrypoint_resolves_funasr_dependencies(path: str):
     installer = Path(path).read_text(encoding="utf-8").lower()

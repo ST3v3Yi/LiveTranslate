@@ -10,6 +10,14 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 
+if not exist ".venv\.livetranslate-ready" (
+    echo [ERROR] Virtual environment setup is incomplete.
+    echo Please run install.bat again to finish installing and verifying dependencies.
+    echo.
+    pause
+    exit /b 1
+)
+
 echo Starting LiveTranslate...
 .venv\Scripts\python.exe main.py
 if errorlevel 1 (

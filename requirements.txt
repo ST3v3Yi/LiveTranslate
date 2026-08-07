@@ -1,5 +1,8 @@
 # Core dependencies
-numpy>=1.24.0
+# Keep NumPy within the range supported by current Numba wheels. Without this
+# cap, uv can backtrack to Numba/llvmlite releases that do not support Python 3.12.
+numpy>=1.24.0,<2.3
+numba>=0.59.0
 PyYAML>=6.0
 httpx>=0.28.0
 openai>=1.0.0

@@ -4,6 +4,7 @@
 $ErrorActionPreference = "Stop"
 $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ProjectDir
+$ReadyMarker = Join-Path $ProjectDir ".venv\.livetranslate-ready"
 
 function Write-Step { param($msg) Write-Host "`n[$((Get-Date).ToString('HH:mm:ss'))] $msg" -ForegroundColor Cyan }
 function Write-Ok   { param($msg) Write-Host "  OK: $msg" -ForegroundColor Green }
@@ -240,6 +241,9 @@ if ($HasNvidia) {
 # ── Step 4: Install PyTorch ──
 Write-Step "Installing PyTorch (this may take a few minutes)..."
 
+# Do not let an interrupted install look complete to start.bat.
+Remove-Item -LiteralPath $ReadyMarker -Force -ErrorAction SilentlyContinue
+
 if ($HasNvidia) {
     Write-Host "  Using index: $CudaVer" -ForegroundColor Gray
     & $Pip install torch torchaudio --index-url https://download.pytorch.org/whl/$CudaVer
@@ -270,10 +274,24 @@ Write-Step "Installing pysbd..."
 
 & $Pip install pysbd
 if ($LASTEXITCODE -ne 0) {
-    Write-Warn "pysbd installation failed (incremental ASR may not work)"
-} else {
-    Write-Ok "pysbd installed"
+    Write-Err "pysbd installation failed"
+    Read-Host "Press Enter to exit"
+    exit 1
 }
+Write-Ok "pysbd installed"
+
+# ── Step 7: Verify environment ──
+Write-Step "Verifying installed dependencies..."
+
+& $Python -m pip check
+if ($LASTEXITCODE -ne 0) {
+    Write-Err "Installed dependencies are inconsistent"
+    Read-Host "Press Enter to exit"
+    exit 1
+}
+
+Set-Content -LiteralPath $ReadyMarker -Value (Get-Date -Format o) -Encoding ascii
+Write-Ok "Environment is ready"
 
 # ── Done ──
 Write-Host ""

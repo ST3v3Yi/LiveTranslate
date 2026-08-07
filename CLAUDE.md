@@ -62,13 +62,13 @@ main.py (LiveTranslateApp)
 Each model in `user_settings.json` has: `name`, `api_base`, `api_key`, `model`, `proxy` ("none"/"system"/custom URL), and optional per-model flags:
 
 - `no_system_role` (bool): Merges system prompt into user message for APIs that reject system role (e.g. Qwen-MT)
-- `no_think` (bool, default True): Passes `extra_body={"enable_thinking": False}` to disable reasoning for thinking models (Qwen3 etc.)
+- `no_think` (bool, default True): Disables reasoning with the provider-specific request shape: DeepSeek uses `extra_body={"thinking": {"type": "disabled"}}`, while Qwen-compatible APIs use `extra_body={"enable_thinking": False}`
 - `streaming` (bool, default True): Per-model streaming toggle; streaming mode yields partial text via `translate_iter()` generator
 - `json_response` (bool, default False): Uses `response_format={"type": "json_schema"}` with schema `{"t": "string"}` for structured output; mutually exclusive with streaming UI display
 - `context_turns` (int, default 0): Number of recent (source, translation) pairs to include as multi-turn context in messages
 - `input_price`/`output_price` (float, per 1M tokens): Token pricing for cost estimation displayed in MonitorBar
 - `overrides` (dict, optional): Per-request OpenAI chat-completion params that override defaults — supported keys `temperature`, `top_p`, `max_tokens`, `frequency_penalty`, `presence_penalty`, `seed`. Only keys present in the dict are sent; absent keys fall back to constructor defaults (temperature/max_tokens) or are omitted entirely (others)
-- `extra_body` (dict, optional): Provider-specific params (e.g. `thinking_budget`, `reasoning_effort`) merged into the request's `extra_body`. Combined with `no_think`'s `enable_thinking=false` when both are set
+- `extra_body` (dict, optional): Provider-specific params (e.g. `thinking`, `thinking_budget`, `reasoning_effort`) merged into the request's `extra_body`. Explicit values override the automatic `no_think` parameter
 - Proxy handling: `proxy="none"` uses `httpx.Client(trust_env=False)` to bypass system proxy; `proxy="system"` uses default httpx behavior (env vars)
 - `Translator._build_request_kwargs()` is the single assembly point — it injects `overrides`, merges `extra_body` with `no_think`, and stamps `response_format` for `json_response`. All three code paths (`_translate_sync`, `_translate_streaming`, streaming `translate_iter`) go through it
 - ModelEditDialog "Advanced Parameters" group uses `[Override] checkbox + value widget` pattern — unchecked rows don't write to the `overrides` dict, preserving backward-compat. `extra_body` is a multi-line JSON text field validated on OK

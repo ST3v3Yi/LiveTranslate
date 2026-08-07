@@ -57,6 +57,7 @@ if not exist ".venv\Scripts\pip.exe" (
 :: Update dependencies
 echo.
 echo Updating dependencies...
+del /q ".venv\.livetranslate-ready" >nul 2>&1
 .venv\Scripts\pip.exe install -r requirements.txt --quiet
 if errorlevel 1 (
     echo [ERROR] Failed to update dependencies.
@@ -65,6 +66,20 @@ if errorlevel 1 (
 )
 
 .venv\Scripts\pip.exe install pysbd --quiet
+if errorlevel 1 (
+    echo [ERROR] Failed to install pysbd.
+    pause
+    exit /b 1
+)
+
+.venv\Scripts\python.exe -m pip check
+if errorlevel 1 (
+    echo [ERROR] Installed dependencies are inconsistent.
+    pause
+    exit /b 1
+)
+
+> ".venv\.livetranslate-ready" echo %DATE% %TIME%
 
 echo.
 echo ========================================
