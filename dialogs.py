@@ -566,7 +566,7 @@ class ModelEditDialog(QDialog):
 
         self._adv_extra_body = QTextEdit()
         self._adv_extra_body.setPlaceholderText(
-            '{"thinking_budget": 1024}'
+            '{"thinking": {"type": "disabled"}}'
         )
         self._adv_extra_body.setToolTip(t("extra_body_hint"))
         self._adv_extra_body.setFixedHeight(70)

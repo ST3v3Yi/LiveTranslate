@@ -59,7 +59,11 @@ Write-Step "Writing launcher..."
 $StartBat = @'
 @echo off
 cd /d "%~dp0"
-if not exist ".venv\Scripts\python.exe" (
+if not exist ".venv\Scripts\python.exe" goto setup
+if not exist ".venv\.livetranslate-ready" goto setup
+goto launch
+
+:setup
     echo First run: setting up environment. This downloads Python and dependencies and may take several minutes...
     powershell -ExecutionPolicy Bypass -File "%~dp0bootstrap.ps1"
     if errorlevel 1 (
@@ -68,7 +72,8 @@ if not exist ".venv\Scripts\python.exe" (
         pause
         exit /b 1
     )
-)
+
+:launch
 echo Starting LiveTranslate...
 .venv\Scripts\python.exe main.py
 if errorlevel 1 (
@@ -84,7 +89,11 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
 $Uv = Join-Path $Root "tools\uv.exe"
+$Ready = Join-Path $Root ".venv\.livetranslate-ready"
 $env:UV_LINK_MODE = "copy"
+
+# A failed setup must never leave the environment looking complete.
+Remove-Item -LiteralPath $Ready -Force -ErrorAction SilentlyContinue
 
 function Enable-SystemProxy {
     # uv (Python download) and pip honor *_PROXY env vars but not the Windows
@@ -122,7 +131,7 @@ function Enable-SystemProxy {
 Enable-SystemProxy
 
 Write-Host "Creating virtual environment with Python 3.12..." -ForegroundColor Cyan
-& $Uv venv --python 3.12 --managed-python .venv
+& $Uv venv --python 3.12 --managed-python --allow-existing .venv
 if ($LASTEXITCODE -ne 0) { Write-Host "Failed to create venv" -ForegroundColor Red; exit 1 }
 $Py = ".venv\Scripts\python.exe"
 
@@ -148,6 +157,12 @@ Write-Host "Installing dependencies..." -ForegroundColor Cyan
 if ($LASTEXITCODE -ne 0) { Write-Host "Dependency install failed" -ForegroundColor Red; exit 1 }
 
 & $Uv pip install --python $Py pysbd
+if ($LASTEXITCODE -ne 0) { Write-Host "pysbd install failed" -ForegroundColor Red; exit 1 }
+
+& $Uv pip check --python $Py
+if ($LASTEXITCODE -ne 0) { Write-Host "Installed dependencies are inconsistent" -ForegroundColor Red; exit 1 }
+
+Set-Content -LiteralPath $Ready -Value (Get-Date -Format o) -Encoding ascii
 
 Write-Host "Setup complete." -ForegroundColor Green
 '@
