@@ -70,9 +70,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
-.venv\Scripts\pip.exe install pysbd --quiet
+.venv\Scripts\pip.exe install "yasbd-lib>=0.15,<1.0" --quiet
 if errorlevel 1 (
-    echo [ERROR] Failed to install pysbd.
+    echo [ERROR] Failed to install yasbd-lib.
     pause
     exit /b 1
 )

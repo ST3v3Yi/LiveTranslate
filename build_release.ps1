@@ -165,8 +165,8 @@ Write-Host "Installing dependencies..." -ForegroundColor Cyan
 & $Uv pip install --python $Py -r requirements.txt
 if ($LASTEXITCODE -ne 0) { Write-Host "Dependency install failed" -ForegroundColor Red; exit 1 }
 
-& $Uv pip install --python $Py pysbd
-if ($LASTEXITCODE -ne 0) { Write-Host "pysbd install failed" -ForegroundColor Red; exit 1 }
+& $Uv pip install --python $Py "yasbd-lib>=0.15,<1.0"
+if ($LASTEXITCODE -ne 0) { Write-Host "yasbd-lib install failed" -ForegroundColor Red; exit 1 }
 
 & $Uv pip check --python $Py
 if ($LASTEXITCODE -ne 0) { Write-Host "Installed dependencies are inconsistent" -ForegroundColor Red; exit 1 }

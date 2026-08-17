@@ -139,8 +139,8 @@ Key overlay features:
 Continuous speech is processed incrementally to reduce latency (enabled by `incremental_asr` setting):
 
 - **Pipeline loop** checks `_do_interim_asr()` every ~1s while VAD is accumulating speech (buffer > `interim_interval`)
-- **Sentence splitting** via `pysbd` library (rule-based, 23 languages, ~0.08ms/call), with comma fallback:
-  - pysbd handles sentence-ending punctuation (。！？!?.) and language-specific rules (Mr./Dr., abbreviations)
+- **Sentence splitting** via `yasbd-lib` (`pysbd_adapter` keeps the pysbd API; rule-based, 40 languages incl. ko, ~0.2ms/call on subtitle-length text), with comma fallback:
+  - the segmenter handles sentence-ending punctuation (。！？!?.) and language-specific rules (Mr./Dr., abbreviations)
   - CJK comma `、` fallback at 25-char threshold (Japanese clause separator)
   - Western comma `,，;；` fallback at 60-char threshold for long unsplit sentences
   - Both fallbacks require `before > 15 chars` and `after > 3 chars` to avoid fragments

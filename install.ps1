@@ -277,16 +277,16 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Ok "Dependencies installed"
 
-# ── Step 6: Install pysbd for incremental ASR ──
-Write-Step "Installing pysbd..."
+# ── Step 6: Install yasbd-lib for incremental ASR sentence splitting ──
+Write-Step "Installing yasbd-lib..."
 
-& $Pip install pysbd
+& $Pip install "yasbd-lib>=0.15,<1.0"
 if ($LASTEXITCODE -ne 0) {
-    Write-Err "pysbd installation failed"
+    Write-Err "yasbd-lib installation failed"
     Read-Host "Press Enter to exit"
     exit 1
 }
-Write-Ok "pysbd installed"
+Write-Ok "yasbd-lib installed"
 
 # ── Step 7: Verify environment ──
 Write-Step "Verifying installed dependencies..."
