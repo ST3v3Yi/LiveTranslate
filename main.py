@@ -484,6 +484,7 @@ class LiveTranslateApp:
             proxy=model_config.get("proxy", "none"),
             no_system_role=model_config.get("no_system_role", False),
             no_think=model_config.get("no_think", True),
+            thinking_style=model_config.get("thinking_style"),
             json_response=model_config.get("json_response", False),
             timeout=timeout,
             overrides=model_config.get("overrides"),

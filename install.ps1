@@ -52,6 +52,14 @@ Write-Host "========================================" -ForegroundColor Magenta
 
 Enable-SystemProxy
 
+# Keep pip's download cache (several GB with CUDA torch) and temp files in
+# the project folder instead of the system drive; both are removed once the
+# install finishes.
+$env:PIP_CACHE_DIR = Join-Path $ProjectDir ".pip-cache"
+$env:TMP = Join-Path $ProjectDir ".tmp"
+$env:TEMP = $env:TMP
+New-Item -ItemType Directory -Force -Path $env:TMP | Out-Null
+
 # ── Step 1: Find Python ──
 Write-Step "Detecting Python..."
 
@@ -292,6 +300,8 @@ if ($LASTEXITCODE -ne 0) {
 
 Set-Content -LiteralPath $ReadyMarker -Value (Get-Date -Format o) -Encoding ascii
 Write-Ok "Environment is ready"
+
+Remove-Item -Recurse -Force $env:PIP_CACHE_DIR, $env:TMP -ErrorAction SilentlyContinue
 
 # ── Done ──
 Write-Host ""
