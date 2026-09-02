@@ -326,6 +326,17 @@ class SubtitleSettingsWidget(QWidget):
         self._settings = {**DEFAULT_SUBTITLE_WIN_SETTINGS, **(settings or {})}
         self._spacing_spin.setValue(self._settings.get("line_spacing", 8))
         self._width_spin.setValue(self._settings.get("window_width", 1000))
+        self._auto_wrap_check.setChecked(self._settings.get("auto_wrap", True))
+        self._dual_segment_check.setChecked(
+            self._settings.get("dual_segment_mode", True)
+        )
+        self._vad_meter_check.setChecked(
+            self._settings.get("show_vad_meter", True)
+        )
+        self._always_on_top_check.setChecked(
+            self._settings.get("always_on_top", True)
+        )
+        self._locked_check.setChecked(self._settings.get("locked", False))
         self._bg_color_btn.set_color(self._settings.get("bg_color", "#000000"))
         self._bg_opacity_spin.setValue(round(self._settings.get("bg_opacity", 0) / 255 * 100))
         self._border_radius_spin.setValue(self._settings.get("border_radius", 8))
@@ -335,6 +346,9 @@ class SubtitleSettingsWidget(QWidget):
         if idx >= 0:
             self._hide_anim_combo.setCurrentIndex(idx)
         self._hide_duration_spin.setValue(self._settings.get("auto_hide_duration", 300))
+        self._click_through_check.setChecked(
+            self._settings.get("click_through", False)
+        )
         self._refresh_lines_list()
 
     def _build_ui(self):
@@ -373,6 +387,44 @@ class SubtitleSettingsWidget(QWidget):
         self._spacing_spin.setValue(self._settings.get("line_spacing", 8))
         self._spacing_spin.valueChanged.connect(self._on_change)
         g.addWidget(self._spacing_spin, r, 1)
+        r += 1
+
+        self._auto_wrap_check = QCheckBox(t("subwin_auto_wrap"))
+        self._auto_wrap_check.setChecked(self._settings.get("auto_wrap", True))
+        self._auto_wrap_check.setToolTip(t("subwin_auto_wrap_hint"))
+        self._auto_wrap_check.toggled.connect(self._on_change)
+
+        self._dual_segment_check = QCheckBox(t("subwin_dual_segment"))
+        self._dual_segment_check.setChecked(
+            self._settings.get("dual_segment_mode", True)
+        )
+        self._dual_segment_check.setToolTip(t("subwin_dual_segment_hint"))
+        self._dual_segment_check.toggled.connect(self._on_change)
+        self._vad_meter_check = QCheckBox(t("subwin_show_vad_meter"))
+        self._vad_meter_check.setChecked(self._settings.get("show_vad_meter", True))
+        self._vad_meter_check.setToolTip(t("subwin_show_vad_meter_hint"))
+        self._vad_meter_check.toggled.connect(self._on_change)
+        subtitle_options = QHBoxLayout()
+        subtitle_options.setContentsMargins(0, 0, 0, 0)
+        subtitle_options.addWidget(self._auto_wrap_check)
+        subtitle_options.addWidget(self._dual_segment_check)
+        subtitle_options.addWidget(self._vad_meter_check)
+        subtitle_options.addStretch()
+        g.addLayout(subtitle_options, r, 0, 1, 2)
+        r += 1
+
+        self._always_on_top_check = QCheckBox(t("subwin_always_on_top"))
+        self._always_on_top_check.setChecked(self._settings.get("always_on_top", True))
+        self._always_on_top_check.setToolTip(t("subwin_always_on_top_hint"))
+        self._always_on_top_check.toggled.connect(self._on_change)
+        g.addWidget(self._always_on_top_check, r, 0, 1, 2)
+        r += 1
+
+        self._locked_check = QCheckBox(t("subwin_lock"))
+        self._locked_check.setChecked(self._settings.get("locked", False))
+        self._locked_check.setToolTip(t("subwin_lock_hint"))
+        self._locked_check.toggled.connect(self._on_change)
+        g.addWidget(self._locked_check, r, 0, 1, 2)
         r += 1
 
         self._bg_color_label = QLabel(t("subwin_bg_color"))
@@ -614,6 +666,11 @@ class SubtitleSettingsWidget(QWidget):
         s = {
             "line_spacing": self._spacing_spin.value(),
             "window_width": self._width_spin.value(),
+            "auto_wrap": self._auto_wrap_check.isChecked(),
+            "dual_segment_mode": self._dual_segment_check.isChecked(),
+            "show_vad_meter": self._vad_meter_check.isChecked(),
+            "always_on_top": self._always_on_top_check.isChecked(),
+            "locked": self._locked_check.isChecked(),
             "bg_color": self._bg_color_btn.color(),
             "bg_opacity": round(self._bg_opacity_spin.value() / 100 * 255),
             "border_radius": self._border_radius_spin.value(),

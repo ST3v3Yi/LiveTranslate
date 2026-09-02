@@ -1,23 +1,20 @@
 @echo off
 cd /d "%~dp0"
-set PATH=%LOCALAPPDATA%\Microsoft\WinGet\Links;%PATH%
+if not exist ".venv\Scripts\python.exe" goto setup
+if not exist ".venv\.livetranslate-ready" goto setup
+goto launch
 
-if not exist ".venv\Scripts\python.exe" (
-    echo [ERROR] Virtual environment not found.
-    echo Please run install.bat first to set up the environment.
-    echo.
-    pause
-    exit /b 1
-)
+:setup
+    echo First run: setting up environment. This downloads Python and dependencies and may take several minutes...
+    powershell -ExecutionPolicy Bypass -File "%~dp0bootstrap.ps1"
+    if errorlevel 1 (
+        echo.
+        echo [ERROR] Setup failed. See messages above.
+        pause
+        exit /b 1
+    )
 
-if not exist ".venv\.livetranslate-ready" (
-    echo [ERROR] Virtual environment setup is incomplete.
-    echo Please run install.bat again to finish installing and verifying dependencies.
-    echo.
-    pause
-    exit /b 1
-)
-
+:launch
 echo Starting LiveTranslate...
 .venv\Scripts\python.exe main.py
 if errorlevel 1 (

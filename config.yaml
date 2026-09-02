@@ -9,7 +9,7 @@ audio:
   chunk_duration: 0.032
 
 asr:
-  # ASR engine: whisper, funasr, anime-whisper
+  # ASR engine: whisper, funasr, anime-whisper, remote-whisper, qwen3-asr
   asr_engine: "funasr"
   # Model size: tiny, base, small, medium, large-v3
   model_size: "medium"
@@ -31,6 +31,15 @@ asr:
   sensevoice_pad_seconds: 0.5
   # faster-whisper input padding bucket in seconds (0 = disabled)
   whisper_pad_seconds: 0.5
+  # Qwen3-ASR paths are auto-detected for the side-by-side project layout.
+  # Override them in Settings -> VAD / ASR if your Conda env or weights differ.
+  qwen3_model_path: ""
+  qwen3_python: ""
+  qwen3_project: ""
+  # Number of accepted previous transcripts supplied to Qwen as recognition context.
+  qwen3_context_turns: 3
+  # Source-language names and domain terms used to bias Qwen3-ASR recognition.
+  qwen3_hotwords: ""
 
 translation:
   # OpenAI-compatible API settings
@@ -49,6 +58,12 @@ translation:
   temperature: 0.3
   # Enable streaming output
   streaming: true
+  # Full terminology table. Only terms matched in the current ASR text are
+  # appended to that translation request.
+  glossary_enabled: true
+  glossary_path: "endfield_terms.csv"
+  glossary_max_entries: 12
+  glossary_max_prompt_chars: 1400
   # System prompt template ({source_lang}, {target_lang}, {context} will be replaced)
   system_prompt: |
     你是一个专业的影视字幕翻译专家。请将以下{source_lang}对话翻译为{target_lang}。
@@ -60,6 +75,14 @@ translation:
 
     近期对话上下文：
     {context}
+
+ocr:
+  # PaddleOCR-VL runs in its own Conda environment and worker process.
+  enabled: true
+  python: "C:/Users/admin/.conda/envs/paddleocr-vl/python.exe"
+  model_path: "D:/Models/PaddleOCR-VL-1.6"
+  device: "gpu:0"
+  cache_dir: "paddlex_cache"
 
 subtitle:
   # Font family

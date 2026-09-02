@@ -7,10 +7,16 @@ __pycache__/
 .uv-cache/
 .tmp/
 models/
+paddlex_cache/
 logs/
 docs/
 transcripts/
 user_settings.json
+tools/
+
+# Local configuration
+.env
+.env.*
 
 # IDE
 .vscode/

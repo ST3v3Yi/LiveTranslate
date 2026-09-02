@@ -142,6 +142,7 @@ ASR_DISPLAY_NAMES = {
     "whisper": "Whisper",
     "anime-whisper": "Anime-Whisper",
     "remote-whisper": "Remote-Whisper",
+    "qwen3-asr": "Qwen3-ASR",
 }
 
 _MODEL_SIZE_BYTES = {
@@ -398,6 +399,11 @@ def _hf_repo_complete(org: str, name: str, min_bytes: int = 50_000_000) -> bool:
 
 
 def is_asr_cached(engine_type, model_size="medium", hub="ms") -> bool:
+    # This model and its dependencies deliberately live outside LiveTranslate's
+    # venv. The Qwen worker validates paths when it starts, so do not route this
+    # engine through the generic model download dialog.
+    if engine_type == "qwen3-asr":
+        return True
     if engine_type == "funasr" or engine_type in FUNASR_LEGACY_ENGINE_ALIASES:
         model_key = (
             FUNASR_LEGACY_ENGINE_ALIASES[engine_type]
@@ -451,6 +457,29 @@ def is_asr_cached(engine_type, model_size="medium", hub="ms") -> bool:
             "Systran", f"faster-whisper-{model_size}", min_bytes=min_bytes
         )
     return True
+
+
+def qwen3_asr_defaults() -> dict[str, str]:
+    """Return best-effort defaults for the adjacent Qwen3-ASR installation."""
+    live_dir = Path(__file__).resolve().parent
+    workspace = live_dir.parent
+    drive_root = Path(live_dir.anchor)
+    conda_base = None
+    conda_exe = os.environ.get("CONDA_EXE")
+    if conda_exe:
+        candidate = Path(conda_exe).resolve().parent.parent
+        if candidate.is_dir():
+            conda_base = candidate
+    if conda_base is None:
+        candidate = drive_root / "Miniconda"
+        if candidate.is_dir():
+            conda_base = candidate
+    python = conda_base / "envs" / "qwen3-asr" / "python.exe" if conda_base else Path()
+    return {
+        "python": str(python) if python else "",
+        "project": str(workspace / "Qwen3-ASR"),
+        "model": str(drive_root / "Models" / "Qwen3-ASR-1.7B"),
+    }
 
 
 def get_missing_models(engine, model_size, hub) -> list:

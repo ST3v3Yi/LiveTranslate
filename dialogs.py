@@ -734,8 +734,10 @@ class ModelEditDialog(QDialog):
             result["streaming"] = False
         if self._json_response.isChecked():
             result["json_response"] = True
-        if self._context_turns.value() > 0:
-            result["context_turns"] = self._context_turns.value()
+        # Zero is a meaningful value: it explicitly disables translation
+        # history.  Always persist it so the runtime matches what the editor
+        # displays instead of treating it as a missing setting.
+        result["context_turns"] = self._context_turns.value()
         if self._input_price.value() > 0:
             result["input_price"] = self._input_price.value()
         if self._output_price.value() > 0:

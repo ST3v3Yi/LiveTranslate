@@ -29,6 +29,7 @@ from model_manager import (
     migrate_funasr_settings,
     normalize_asr_engine_selection,
     normalize_funasr_model_key,
+    qwen3_asr_defaults,
     resolve_custom_whisper_model,
 )
 
@@ -43,7 +44,8 @@ import torch  # noqa: F401
 from audio_capture import AudioCapture
 from vad_processor import VADProcessor
 from asr_client import ASRClient, ASRWorkerError, ASRWorkerExited, ASRWorkerTimeout
-from translator import Translator, RepetitionError
+from translator import SCREENSHOT_TRANSLATION_PROMPT, Translator, RepetitionError
+from term_glossary import TermGlossary
 from transcript_writer import TranscriptWriter
 
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QDialog, QMessageBox
@@ -57,11 +59,13 @@ from PyQt6.QtGui import (
     QFont,
     QFontDatabase,
 )
-from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QTimer, Qt
 
 from subtitle_overlay import SubtitleOverlay
 from subtitle_window import SubtitleWindow
 from log_window import LogWindow
+from screenshot_selector import ScreenRegionSelector
+from screenshot_translation import ScreenshotTranslationOverlay
 from control_panel import (
     ControlPanel,
     SETTINGS_FILE,
@@ -208,6 +212,14 @@ class LiveTranslateApp:
         self._asr_worker_baseline_mb = None
         self._asr_recycle_delta_mb = 2048
         self._target_language = config["translation"]["target_language"]
+        self._translator = None
+        self._glossary = None
+        self._glossary_enabled = bool(
+            config["translation"].get("glossary_enabled", True)
+        )
+        self._glossary_paths = self._resolve_glossary_paths()
+        self._glossary_signature = None
+        self._reload_translation_glossaries(force=True)
         self._translator = Translator(
             api_base=config["translation"]["api_base"],
             api_key=config["translation"]["api_key"],
@@ -217,6 +229,7 @@ class LiveTranslateApp:
             temperature=config["translation"]["temperature"],
             streaming=config["translation"]["streaming"],
             system_prompt=config["translation"].get("system_prompt"),
+            glossary=self._glossary if self._glossary_enabled else None,
         )
         self._translator.set_context_turns(
             config["translation"].get("context_window", 0)
@@ -227,7 +240,10 @@ class LiveTranslateApp:
         self._capture_thread = None
         self._asr_thread = None
         self._asr_queue = queue.Queue(maxsize=16)
-        self._tl_executor = ThreadPoolExecutor(max_workers=8)
+        # Ollama serializes requests for one loaded model. Keeping live subtitles
+        # on one client-side lane prevents stale requests piling up in Ollama.
+        self._tl_executor = ThreadPoolExecutor(max_workers=1)
+        self._aux_tl_executor = ThreadPoolExecutor(max_workers=2)
 
         self._transcript = TranscriptWriter(Path(__file__).parent / "transcripts")
 
@@ -265,6 +281,25 @@ class LiveTranslateApp:
         self._last_interim_check_time = 0.0
         self._interim_committed_tail = ""
 
+        # Qwen recovery state: a short segment that produced no text is retained
+        # briefly and prepended to the next segment. This recovers speech split
+        # around a VAD boundary without delaying normal successful utterances.
+        self._qwen_retry_audio = None
+        self._qwen_retry_deadline = 0.0
+        self._qwen_retry_max_seconds = 3.5
+        self._qwen_retry_window_seconds = 5.0
+
+        # A max-duration VAD split can land in the middle of a sentence.  Keep
+        # only an unterminated first part and join it to the next full ASR result
+        # before translation; natural VAD silence still emits immediately.
+        self._forced_split_pending = None
+
+        # PaddleOCR-VL is loaded lazily in its own Conda subprocess.  Starting
+        # it only when the first screenshot is requested keeps normal ASR
+        # startup fast and avoids importing Paddle into the main process.
+        self._ocr_client = None
+        self._ocr_lock = threading.RLock()
+
     def set_overlay(self, overlay: SubtitleOverlay):
         self._overlay = overlay
 
@@ -277,16 +312,260 @@ class LiveTranslateApp:
         panel.model_changed.connect(self._on_model_changed)
         panel.models_list_changed.connect(self._on_models_list_changed)
 
+    def _ocr_settings(self):
+        settings = self._panel.get_settings() if self._panel else {}
+        cfg = self._config.get("ocr") or {}
+        return {
+            "enabled": bool(settings.get("ocr_enabled", cfg.get("enabled", True))),
+            "python": settings.get("ocr_python") or cfg.get("python", ""),
+            "model_path": settings.get("ocr_model_path") or cfg.get("model_path", ""),
+            "device": settings.get("ocr_device") or cfg.get("device", "gpu:0"),
+            "cache_dir": settings.get("ocr_cache_dir") or cfg.get("cache_dir", "paddlex_cache"),
+        }
+
+    def _get_ocr_client(self):
+        from ocr_paddle import PaddleOCRClient
+
+        settings = self._ocr_settings()
+        if not settings["enabled"]:
+            raise RuntimeError("OCR is disabled in settings")
+        if not settings["python"]:
+            raise RuntimeError("OCR Python path is not configured")
+        if not settings["model_path"]:
+            raise RuntimeError("PaddleOCR-VL model path is not configured")
+        with self._ocr_lock:
+            if self._ocr_client is None:
+                cache_dir = Path(settings["cache_dir"])
+                if not cache_dir.is_absolute():
+                    cache_dir = Path(__file__).parent / cache_dir
+                self._ocr_client = PaddleOCRClient(
+                    settings["python"],
+                    settings["model_path"],
+                    settings["device"],
+                    cache_dir,
+                )
+                self._ocr_client.start()
+            return self._ocr_client
+
+    def translate_screenshot(self, image, result_window):
+        """Run OCR and translate each detected text region in the background."""
+        try:
+            self._aux_tl_executor.submit(
+                self._translate_screenshot_job, image, result_window
+            )
+        except RuntimeError:
+            self._set_screenshot_error(result_window, "翻译管线已经停止")
+
+    @staticmethod
+    def _set_screenshot_error(result_target, message):
+        if hasattr(result_target, "set_error"):
+            result_target.set_error(str(message))
+        else:
+            result_target.set_status(str(message))
+
+    @staticmethod
+    def _qimage_png_bytes(image):
+        data = QByteArray()
+        buffer = QBuffer(data)
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        image.save(buffer, "PNG")
+        buffer.close()
+        return bytes(data)
+
+    def _translate_screenshot_job(self, image, result_window):
+        try:
+            result_window.set_status("正在加载 OCR 模型…")
+            client = self._get_ocr_client()
+            result_window.set_status("正在识别文字…")
+            payload = client.recognize(self._qimage_png_bytes(image))
+            regions = payload.get("regions") or []
+            if not regions:
+                log.info("Screenshot OCR returned no text regions")
+                self._set_screenshot_error(result_window, "未识别到文字，请重新框选更清晰的区域")
+                return
+
+            settings = self._panel.get_settings() if self._panel else {}
+            source_lang = settings.get("asr_language", "auto")
+            target_lang = self._target_language
+            # Screenshot text is fragmented UI/OCR data, not spoken dialogue.
+            # Keep a prompt-isolated translator so a detailed subtitle prompt
+            # cannot be echoed back onto a tiny button or icon label.
+            screenshot_translator = self._translator.with_system_prompt(
+                SCREENSHOT_TRANSLATION_PROMPT
+            )
+            translated_regions = []
+            total = len(regions)
+            for index, region in enumerate(regions, 1):
+                source_text = str(region.get("text") or "").strip()
+                if not source_text:
+                    continue
+                source_text = self._normalize_glossary_source(source_text, source_lang)
+                result_window.set_status(f"正在翻译文字 {index}/{total}…")
+                if source_lang == target_lang:
+                    translated = source_text
+                else:
+                    translated = screenshot_translator.translate(source_text, source_lang)
+                translated = str(translated or "").strip()
+                if self._is_screenshot_prompt_leak(source_text, translated):
+                    log.warning(
+                        "Discarded screenshot translation that resembles prompt text: %r",
+                        translated[:120],
+                    )
+                    continue
+                if translated:
+                    item = dict(region)
+                    item["text"] = source_text
+                    item["translation"] = translated
+                    translated_regions.append(item)
+
+            if not translated_regions:
+                self._set_screenshot_error(result_window, "已识别文字，但没有获得可用译文")
+                return
+            from screenshot_translation import compose_translated_image
+
+            translated_image = compose_translated_image(image, translated_regions)
+            log.info(
+                "Screenshot translated: regions=%d, ocr_ms=%.0f",
+                len(translated_regions),
+                float(payload.get("ocr_ms") or 0),
+            )
+            result_window.set_status(
+                f"识别完成，正在生成翻译预览（{len(translated_regions)} 段文字）…"
+            )
+            result_window.set_result(translated_image)
+        except Exception as exc:
+            log.error("Screenshot translation failed: %s", exc, exc_info=True)
+            self._set_screenshot_error(result_window, f"截图翻译失败：{exc}")
+
+    @staticmethod
+    def _is_screenshot_prompt_leak(source_text, translated_text):
+        """Prevent model rule/prompt echoes from being drawn into screenshots."""
+        if not translated_text:
+            return False
+        lowered = translated_text.casefold()
+        prompt_markers = (
+            "硬性规则",
+            "只输出译文",
+            "禁止任何解释",
+            "结合上下文",
+            "输出尽量短句",
+            "字幕阅读",
+            "官方固定译名",
+            "translate only",
+            "return only",
+            "screenshot text",
+        )
+        if any(marker in lowered for marker in prompt_markers):
+            return True
+        # A one- or two-character OCR fragment cannot legitimately expand into
+        # a long instruction paragraph. Keep normal sentences unrestricted.
+        return len(source_text.strip()) <= 12 and len(translated_text) >= 80
+
+    def _resolve_glossary_paths(self, values=None):
+        if values is None:
+            values = self._config["translation"].get("glossary_paths")
+            if values is None:
+                values = self._config["translation"].get("glossary_path")
+        if isinstance(values, (str, Path)):
+            values = [values]
+        output = []
+        seen = set()
+        for value in values or []:
+            path = Path(str(value))
+            if not path.is_absolute():
+                path = Path(__file__).parent / path
+            path = path.resolve()
+            key = str(path).casefold()
+            if key not in seen:
+                output.append(path)
+                seen.add(key)
+        return output
+
+    def _reload_translation_glossaries(self, paths=None, force=False):
+        if paths is not None:
+            self._glossary_paths = self._resolve_glossary_paths(paths)
+        signature = []
+        for path in self._glossary_paths:
+            try:
+                stat = path.stat()
+                signature.append((str(path), stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                signature.append((str(path), None, None))
+        signature = tuple(signature)
+        if not force and signature == self._glossary_signature:
+            return
+
+        entries = []
+        loaded_files = 0
+        for path in self._glossary_paths:
+            try:
+                glossary = TermGlossary.from_file(path)
+                entries.extend(glossary.entries)
+                loaded_files += 1
+                log.info(
+                    "Translation glossary source loaded: %d entries from %s",
+                    len(glossary.entries),
+                    path,
+                )
+            except Exception as exc:
+                log.warning("Translation glossary could not be loaded from %s: %s", path, exc)
+
+        if entries:
+            self._glossary = TermGlossary(
+                entries,
+                max_entries=self._config["translation"].get(
+                    "glossary_max_entries", 12
+                ),
+                max_prompt_chars=self._config["translation"].get(
+                    "glossary_max_prompt_chars", 1400
+                ),
+            )
+            log.info(
+                "Translation glossaries %s: %d files, %d merged entries",
+                "active" if self._glossary_enabled else "loaded (module disabled)",
+                loaded_files,
+                len(self._glossary.entries),
+            )
+        else:
+            self._glossary = None
+            log.info("Translation glossaries disabled or unavailable")
+        self._glossary_signature = signature
+        if getattr(self, "_translator", None) is not None:
+            self._translator.set_glossary(
+                self._glossary if self._glossary_enabled else None
+            )
+
+    def _set_glossary_enabled(self, enabled: bool):
+        enabled = bool(enabled)
+        changed = enabled != self._glossary_enabled
+        self._glossary_enabled = enabled
+        if self._translator is not None:
+            self._translator.set_glossary(self._glossary if enabled else None)
+        if changed:
+            log.info(
+                "Terminology module %s: ASR normalization and translation prompt injection %s",
+                "enabled" if enabled else "disabled",
+                "active" if enabled else "bypassed",
+            )
+
     def _on_models_list_changed(self, models: list, active_idx: int):
         if self._overlay:
             self._overlay.set_models(models, active_idx)
 
     def _on_settings_changed(self, settings):
         self._vad.update_settings(settings)
+        if "glossary_enabled" in settings:
+            self._set_glossary_enabled(settings["glossary_enabled"])
+        if "glossary_paths" in settings:
+            self._reload_translation_glossaries(settings["glossary_paths"])
         if "style" in settings and self._overlay:
             self._overlay.apply_style(settings["style"])
         if "asr_language" in settings:
             self._set_asr_language(settings["asr_language"])
+        if "qwen3_context_turns" in settings:
+            self._set_qwen_context_turns(settings["qwen3_context_turns"])
+        if "qwen3_hotwords" in settings:
+            self._set_qwen_hotwords(settings["qwen3_hotwords"])
         if "sensevoice_pad_seconds" in settings:
             self._set_asr_padding("funasr", settings["sensevoice_pad_seconds"])
         if "whisper_pad_seconds" in settings:
@@ -299,6 +578,9 @@ class LiveTranslateApp:
                 "whisper_model_size",
                 "funasr_model",
                 "hub",
+                "qwen3_model_path",
+                "qwen3_python",
+                "qwen3_project",
             )
         ):
             self._switch_asr_engine(
@@ -375,6 +657,23 @@ class LiveTranslateApp:
     def _set_asr_language(self, language: str):
         with self._asr_pending_lock:
             self._asr_pending_language = language
+        self._clear_qwen_retry()
+
+    def _set_qwen_context_turns(self, turns):
+        turns = max(0, int(turns))
+        with self._asr_lock:
+            client = self._asr if self._asr_type == "qwen3-asr" else None
+        if client is not None and hasattr(client, "set_context_turns"):
+            client.set_context_turns(turns)
+        self._update_restart_config(qwen_context_turns=turns)
+
+    def _set_qwen_hotwords(self, text):
+        text = str(text or "").strip()
+        with self._asr_lock:
+            client = self._asr if self._asr_type == "qwen3-asr" else None
+        if client is not None and hasattr(client, "set_static_context"):
+            client.set_static_context(text)
+        self._update_restart_config(qwen_hotwords=text)
 
     def _set_asr_padding(self, engine_type: str, pad_seconds):
         with self._asr_pending_lock:
@@ -429,6 +728,16 @@ class LiveTranslateApp:
 
             url = config.get("remote_asr_url") or "http://127.0.0.1:8765"
             engine = RemoteASREngine(server_url=url)
+            language = config.get("language")
+            if language:
+                engine.set_language(language)
+            return engine
+        if config.get("engine_type") == "qwen3-asr":
+            from asr_qwen3 import Qwen3ASRClient
+
+            engine = Qwen3ASRClient(config, request_timeout=60.0)
+            engine.start()
+            engine.wait_ready()
             language = config.get("language")
             if language:
                 engine.set_language(language)
@@ -489,11 +798,15 @@ class LiveTranslateApp:
             timeout=timeout,
             overrides=model_config.get("overrides"),
             extra_body=model_config.get("extra_body"),
+            glossary=self._glossary if self._glossary_enabled else None,
         )
-        context_turns = model_config.get(
-            "context_turns", self._config["translation"].get("context_window", 0)
-        )
+        # Model editor semantics: 0 disables translation history.  Older saved
+        # model entries may not contain this field because the editor used to
+        # omit zero; treat those entries as zero rather than silently falling
+        # back to the global context window.
+        context_turns = model_config.get("context_turns", 0)
         self._translator.set_context_turns(context_turns)
+        log.info(f"Translator context turns: {context_turns}")
         self._input_price = model_config.get("input_price", 0)
         self._output_price = model_config.get("output_price", 0)
 
@@ -525,6 +838,10 @@ class LiveTranslateApp:
             "remote_asr_url",
             self._config["asr"].get("remote_asr_url", "http://127.0.0.1:8765"),
         )
+        qwen_defaults = qwen3_asr_defaults()
+        qwen_model_path = settings.get("qwen3_model_path") or qwen_defaults["model"]
+        qwen_python = settings.get("qwen3_python") or qwen_defaults["python"]
+        qwen_project = settings.get("qwen3_project") or qwen_defaults["project"]
 
         compute = self._config["asr"]["compute_type"]
         if engine_type == "whisper":
@@ -534,6 +851,8 @@ class LiveTranslateApp:
         elif engine_type == "remote-whisper":
             # URL is part of the identity so editing it triggers a reconnect.
             signature_model = remote_asr_url
+        elif engine_type == "qwen3-asr":
+            signature_model = (qwen_model_path, qwen_python, qwen_project)
         else:
             signature_model = engine_type
         signature = (engine_type, signature_model, device, hub, compute)
@@ -558,6 +877,7 @@ class LiveTranslateApp:
         self._last_interim_samples = 0
         self._last_interim_check_time = 0.0
         self._interim_committed_tail = ""
+        self._clear_qwen_retry()
         self._vad.flush()
         self._vad._reset()
 
@@ -572,6 +892,8 @@ class LiveTranslateApp:
             display_name = f"Whisper {display_model}"
         elif engine_type == "funasr":
             display_name = funasr_display_name(funasr_model)
+        elif engine_type == "qwen3-asr":
+            display_name = "Qwen3-ASR 1.7B"
 
         parent = (
             self._panel if self._panel and self._panel.isVisible() else self._overlay
@@ -603,6 +925,18 @@ class LiveTranslateApp:
             "download_root": str((MODELS_DIR / "huggingface" / "hub").resolve()),
             "display_name": display_name,
             "remote_asr_url": remote_asr_url,
+            "qwen_model_path": qwen_model_path,
+            "qwen_python": qwen_python,
+            "qwen_project": qwen_project,
+            "qwen_dtype": "auto",
+            "qwen_max_new_tokens": int(settings.get("qwen3_max_new_tokens", 128)),
+            "qwen_context_turns": int(settings.get("qwen3_context_turns", 3)),
+            "qwen_context_max_chars": 320,
+            "qwen_hotwords": settings.get("qwen3_hotwords", ""),
+            "qwen_static_context_max_chars": 1536,
+            "qwen_refine_enabled": bool(
+                settings.get("qwen3_refine_enabled", False)
+            ),
         }
         target_state = {
             "type": engine_type,
@@ -1092,7 +1426,9 @@ class LiveTranslateApp:
             self._total_prompt_tokens += pt
             self._total_completion_tokens += ct
             cost = self._compute_cost()
-            log.info(f"Translate ({tl_ms:.0f}ms): {translated}")
+            ttft_ms = self._translator.last_first_token_ms
+            ttft_text = f", first_token={ttft_ms:.0f}ms" if ttft_ms is not None else ""
+            log.info(f"Translate ({tl_ms:.0f}ms{ttft_text}): {translated}")
             if translated:
                 self._transcript.write_translation(msg_id, translated)
             else:
@@ -1140,7 +1476,7 @@ class LiveTranslateApp:
 
         futures = []
         for lang in extra_langs:
-            futures.append(self._tl_executor.submit(_do_translate, lang))
+            futures.append(self._aux_tl_executor.submit(_do_translate, lang))
 
         for future in as_completed(futures):
             try:
@@ -1166,8 +1502,8 @@ class LiveTranslateApp:
     def start(self):
         if self._running:
             return
-        n = len(self._subwin.get_target_languages()) if self._subwin else 1
-        self._tl_executor = ThreadPoolExecutor(max_workers=max(8, n + 1))
+        self._tl_executor = ThreadPoolExecutor(max_workers=1)
+        self._aux_tl_executor = ThreadPoolExecutor(max_workers=2)
         self._asr_queue = queue.Queue(maxsize=16)
         self._running = True
         self._paused = False
@@ -1219,7 +1555,9 @@ class LiveTranslateApp:
         self._last_interim_samples = 0
         self._last_interim_check_time = 0.0
         self._interim_committed_tail = ""
+        self._flush_forced_split_pending("pipeline stopped")
         self._tl_executor.shutdown(wait=True)
+        self._aux_tl_executor.shutdown(wait=True)
         self._transcript.close()
         if self._mem_periodic_timer is not None:
             try:
@@ -1235,7 +1573,18 @@ class LiveTranslateApp:
             f"asr_calls={self._mem_asr_call_count} outputs={self._asr_count}"
         )
         self._shutdown_asr_worker()
+        self._shutdown_ocr_worker()
         log.info("Pipeline stopped")
+
+    def _shutdown_ocr_worker(self):
+        with self._ocr_lock:
+            client = self._ocr_client
+            self._ocr_client = None
+        if client is not None:
+            try:
+                client.shutdown()
+            except Exception as exc:
+                log.warning("PaddleOCR worker shutdown failed: %s", exc)
 
     def pause(self):
         self._paused = True
@@ -1244,21 +1593,201 @@ class LiveTranslateApp:
         self._last_interim_samples = 0
         self._last_interim_check_time = 0.0
         self._interim_committed_tail = ""
+        self._flush_forced_split_pending("pipeline paused")
         if self._overlay:
             self._overlay.update_monitor(0.0, 0.0)
+        if self._subwin and self._subwin.isVisible():
+            self._subwin.update_vad(0.0)
         log.info("Pipeline paused")
 
     def resume(self):
         self._paused = False
         log.info("Pipeline resumed")
 
-    def _process_segment(self, speech_segment):
+    def _clear_qwen_retry(self):
+        self._qwen_retry_audio = None
+        self._qwen_retry_deadline = 0.0
+
+    def _prepare_qwen_segment(self, speech_segment):
+        with self._asr_lock:
+            is_qwen = self._asr_type == "qwen3-asr"
+        if not is_qwen:
+            self._clear_qwen_retry()
+            return speech_segment
+
+        retry = self._qwen_retry_audio
+        deadline = self._qwen_retry_deadline
+        self._clear_qwen_retry()
+        if retry is None:
+            return speech_segment
+        if time.monotonic() > deadline:
+            log.debug("Qwen retry buffer expired")
+            return speech_segment
+
+        combined = np.concatenate((retry, speech_segment))
+        log.info(
+            "Qwen retry: merged %.1fs empty segment with %.1fs next segment",
+            len(retry) / 16000,
+            len(speech_segment) / 16000,
+        )
+        return combined
+
+    def _remember_qwen_retry(self, speech_segment, reason: str):
+        with self._asr_lock:
+            is_qwen = self._asr_type == "qwen3-asr"
+        duration = len(speech_segment) / 16000
+        if not is_qwen or duration > self._qwen_retry_max_seconds:
+            return
+        self._qwen_retry_audio = np.asarray(speech_segment, dtype=np.float32).copy()
+        self._qwen_retry_deadline = (
+            time.monotonic() + self._qwen_retry_window_seconds
+        )
+        log.info(
+            "Qwen retry: buffered %.1fs segment after %s",
+            duration,
+            reason,
+        )
+
+    def _commit_qwen_context(self, text: str):
+        with self._asr_lock:
+            client = self._asr if self._asr_type == "qwen3-asr" else None
+        if client is not None and hasattr(client, "commit_context"):
+            client.commit_context(text)
+
+    @staticmethod
+    def _has_terminal_punctuation(text: str) -> bool:
+        return str(text or "").rstrip().endswith(("。", "！", "？", "!", "?", "…"))
+
+    def _merge_forced_split_text(self, text: str, source_lang: str, asr_ms: float,
+                                 split_reason: str):
+        """Defer only an unterminated maximum-duration VAD split.
+
+        This is intentionally audio-boundary based, not incremental ASR: every
+        part was transcribed from a completed VAD audio segment exactly once.
+        """
+        pending = self._forced_split_pending
+        if pending is not None:
+            if pending["source_lang"] != source_lang:
+                log.warning(
+                    "Forced VAD split language changed (%s -> %s); merging as %s",
+                    pending["source_lang"], source_lang, pending["source_lang"],
+                )
+            text = pending["text"] + text
+            source_lang = pending["source_lang"]
+            asr_ms += pending["asr_ms"]
+            self._forced_split_pending = None
+            log.info("Forced VAD split merged before translation: %d chars", len(text))
+
+        if split_reason == "max_duration" and not self._has_terminal_punctuation(text):
+            self._forced_split_pending = {
+                "text": text,
+                "source_lang": source_lang,
+                "asr_ms": asr_ms,
+            }
+            log.info(
+                "Forced VAD split deferred before translation (unterminated, %d chars): %s",
+                len(text), text[:80],
+            )
+            return None
+        return text, source_lang, asr_ms
+
+    def _flush_forced_split_pending(self, reason: str):
+        pending = self._forced_split_pending
+        self._forced_split_pending = None
+        if pending is None:
+            return
+        log.info("Emitting deferred forced VAD split (%s): %s", reason, pending["text"][:80])
+        self._process_segment_text(
+            pending["text"], pending["source_lang"], pending["asr_ms"],
+            kind="forced-final",
+        )
+
+    def _verify_qwen_keyword_only_result(self, audio, result, asr_ms):
+        """Reject keyword-list echoes while preserving genuinely spoken names."""
+        with self._asr_lock:
+            client = self._asr if self._asr_type == "qwen3-asr" else None
+        text = str((result or {}).get("text") or "").strip()
+        if (
+            client is None
+            or not text
+            or not hasattr(client, "is_static_context_echo")
+            or not client.is_static_context_echo(text)
+        ):
+            return result, asr_ms
+
+        log.warning(
+            "Qwen ASR result matches only an ASR keyword; verifying without keyword context: %r",
+            text,
+        )
+        started = time.perf_counter()
+        try:
+            verified = client.transcribe(audio, use_static_context=False)
+        except Exception as exc:
+            log.warning("Qwen keyword-only verification failed; discarding result: %s", exc)
+            return None, asr_ms
+        verify_ms = (time.perf_counter() - started) * 1000
+        verified_text = str((verified or {}).get("text") or "").strip()
+        if not verified_text or not any(char.isalnum() for char in verified_text):
+            log.info("Discarded Qwen ASR keyword-only echo after empty audio verification")
+            return None, asr_ms + verify_ms
+        log.info(
+            "Qwen keyword-only verification: %r -> %r (%.0fms)",
+            text[:80], verified_text[:80], verify_ms,
+        )
+        return verified, asr_ms + verify_ms
+
+    def _maybe_refine_qwen_result(self, audio, result, first_pass_ms):
+        """Optionally run a second audio-grounded Qwen decode for smoothing."""
+        settings = self._panel.get_settings() if self._panel else {}
+        if not settings.get("qwen3_refine_enabled", False):
+            return result, first_pass_ms
+        with self._asr_lock:
+            client = self._asr if self._asr_type == "qwen3-asr" else None
+        draft = str((result or {}).get("text") or "").strip()
+        if client is None or not draft or not hasattr(client, "refine"):
+            return result, first_pass_ms
+        started = time.perf_counter()
+        try:
+            refined = client.refine(audio, draft)
+        except Exception as exc:
+            log.warning("Qwen ASR refinement failed; keeping first pass: %s", exc)
+            return result, first_pass_ms
+        refine_ms = (time.perf_counter() - started) * 1000
+        refined_text = str((refined or {}).get("text") or "").strip()
+        if not refined_text or not any(char.isalnum() for char in refined_text):
+            log.info("Qwen ASR refinement returned no usable text; keeping first pass")
+            return result, first_pass_ms + refine_ms
+        log.info(
+            "Qwen ASR refinement: %.0fms; %r -> %r",
+            refine_ms,
+            draft[:80],
+            refined_text[:80],
+        )
+        return refined, first_pass_ms + refine_ms
+
+    def _normalize_glossary_source(self, text: str, source_lang: str) -> str:
+        if not self._glossary_enabled:
+            return text
+        glossary = self._glossary
+        if glossary is None:
+            return text
+        normalized, corrections = glossary.normalize_source(text, source_lang)
+        if corrections:
+            changes = ", ".join(
+                f"{source} -> {canonical}" for source, canonical in corrections
+            )
+            log.info("Glossary ASR normalization [%s]: %s", source_lang, changes)
+        return normalized
+
+    def _process_segment(self, speech_segment, split_reason="silence"):
         """Run ASR + translation on a speech segment. Called from ASR thread and stop()."""
+        speech_segment = self._prepare_qwen_segment(speech_segment)
         seg_len = len(speech_segment) / 16000
-        log.info(f"Speech segment: {seg_len:.1f}s")
+        log.info("Speech segment: %.1fs (%s)", seg_len, split_reason)
 
         try:
-            result, asr_ms = self._run_asr(speech_segment, "segment")
+            kind = "forced_split" if split_reason == "max_duration" else "segment"
+            result, asr_ms = self._run_asr(speech_segment, kind)
         except Exception as e:
             log.error(f"ASR error: {e}", exc_info=True)
             return
@@ -1267,7 +1796,19 @@ class LiveTranslateApp:
         if asr_ms > 10000:
             log.warning(f"ASR took {asr_ms:.0f}ms, possible hang")
         if result is None:
+            self._remember_qwen_retry(speech_segment, "empty ASR result")
             return
+
+        result, asr_ms = self._verify_qwen_keyword_only_result(
+            speech_segment, result, asr_ms
+        )
+        if result is None:
+            self._remember_qwen_retry(speech_segment, "keyword-only ASR result")
+            return
+
+        result, asr_ms = self._maybe_refine_qwen_result(
+            speech_segment, result, asr_ms
+        )
 
         original_text = result["text"].strip()
         # Skip empty or punctuation-only ASR results
@@ -1275,6 +1816,7 @@ class LiveTranslateApp:
             log.debug(
                 f"ASR returned empty/punctuation-only, skipping: '{result['text']}'"
             )
+            self._remember_qwen_retry(speech_segment, "empty text")
             return
 
         # Skip suspiciously short text from long segments (likely noise)
@@ -1283,6 +1825,7 @@ class LiveTranslateApp:
             log.debug(
                 f"Noise filter: {seg_len:.1f}s segment produced only '{original_text}', skipping"
             )
+            self._remember_qwen_retry(speech_segment, "noise-filtered text")
             return
 
         source_lang = result["language"]
@@ -1293,6 +1836,15 @@ class LiveTranslateApp:
                 f"discarding: {original_text[:60]}"
             )
             return
+
+        original_text = self._normalize_glossary_source(original_text, source_lang)
+        self._commit_qwen_context(original_text)
+        merged = self._merge_forced_split_text(
+            original_text, source_lang, asr_ms, split_reason
+        )
+        if merged is None:
+            return
+        original_text, source_lang, asr_ms = merged
 
         self._asr_count += 1
         self._msg_id += 1
@@ -1526,7 +2078,8 @@ class LiveTranslateApp:
         log.info(f"Interim ASR: committed {len(complete)} sentence(s), trimmed {trim_samples / 16000:.2f}s")
         return True
 
-    def _process_segment_text(self, text: str, source_lang: str, asr_ms: float = 0):
+    def _process_segment_text(self, text: str, source_lang: str, asr_ms: float = 0,
+                              kind="interim"):
         """Output a text result (from interim or final) — similar to _process_segment but skips ASR."""
         original_text = text.strip()
         if not original_text or not any(c.isalnum() for c in original_text):
@@ -1537,11 +2090,14 @@ class LiveTranslateApp:
             log.info(f"Language filter: expected '{asr_lang_setting}' but got '{source_lang}', discarding: {original_text[:60]}")
             return
 
+        original_text = self._normalize_glossary_source(original_text, source_lang)
+        self._commit_qwen_context(original_text)
+
         self._asr_count += 1
         self._msg_id += 1
         msg_id = self._msg_id
         timestamp = datetime.now().strftime("%H:%M:%S")
-        log.info(f"ASR [{source_lang}] ({asr_ms:.0f}ms, interim): {original_text}")
+        log.info(f"ASR [{source_lang}] ({asr_ms:.0f}ms, {kind}): {original_text}")
 
         if self._overlay:
             self._overlay.add_message(msg_id, timestamp, original_text, source_lang, asr_ms)
@@ -1637,7 +2193,12 @@ class LiveTranslateApp:
                         with self._vad_lock:
                             seg = self._vad.process_chunk(silence_chunk)
                         if seg is not None and self._asr_ready:
-                            self._enqueue_asr("vad_flush", seg)
+                            self._enqueue_asr(
+                                "vad_forced_split"
+                                if self._vad.last_flush_reason == "max_duration"
+                                else "vad_flush",
+                                seg,
+                            )
                             break
                 continue
 
@@ -1653,6 +2214,9 @@ class LiveTranslateApp:
 
             with self._vad_lock:
                 speech_segment = self._vad.process_chunk(chunk)
+
+            if self._subwin and self._subwin.isVisible():
+                self._subwin.update_vad(self._vad.last_confidence)
 
             if speech_segment is None:
                 # Still accumulating — check for interim ASR
@@ -1672,7 +2236,12 @@ class LiveTranslateApp:
                 log.debug("ASR not ready, dropping segment")
                 continue
 
-            self._enqueue_asr("vad_flush", speech_segment)
+            self._enqueue_asr(
+                "vad_forced_split"
+                if self._vad.last_flush_reason == "max_duration"
+                else "vad_flush",
+                speech_segment,
+            )
 
     def _enqueue_asr(self, seg_type: str, segment):
         try:
@@ -1707,11 +2276,16 @@ class LiveTranslateApp:
 
             seg_type, segment = item
 
-            if seg_type == "vad_flush":
+            if seg_type in ("vad_flush", "vad_forced_split"):
                 if self._interim_active:
                     self._process_interim_final(segment)
                 else:
-                    self._process_segment(segment)
+                    self._process_segment(
+                        segment,
+                        split_reason="max_duration"
+                        if seg_type == "vad_forced_split"
+                        else "silence",
+                    )
                 self._interim_active = False
                 self._interim_pending = ""
                 self._last_interim_samples = 0
@@ -1844,6 +2418,15 @@ def main():
     panel = ControlPanel(config, saved_settings=saved)
 
     overlay = SubtitleOverlay(config["subtitle"])
+    _restore_overlay_topmost_after_panel = [False]
+
+    def _on_panel_visibility_changed(visible: bool):
+        if visible or not _restore_overlay_topmost_after_panel[0]:
+            return
+        _restore_overlay_topmost_after_panel[0] = False
+        overlay._set_topmost(True)
+
+    panel.visibility_changed.connect(_on_panel_visibility_changed)
     if saved:
         ox = saved.get("overlay_x")
         oy = saved.get("overlay_y")
@@ -1869,6 +2452,84 @@ def main():
     live_trans.set_overlay(overlay)
     live_trans.set_subtitle_window(subwin)
     live_trans.set_panel(panel)
+
+    # Screenshot translation workflow.  Keep the selector alive through the
+    # asynchronous Qt signals and temporarily hide our own overlay so it is
+    # not captured into the source image.
+    _screenshot_selector = [None]
+    _screenshot_translation_overlay = [None]
+    _overlay_was_visible = [False]
+
+    def _restore_overlay_after_screenshot():
+        if _overlay_was_visible[0]:
+            overlay.show()
+            overlay.raise_()
+        _overlay_was_visible[0] = False
+
+    def _on_screenshot_requested():
+        ocr_settings = live_trans._ocr_settings()
+        if not ocr_settings["enabled"]:
+            QMessageBox.information(
+                panel,
+                t("screenshot"),
+                t("screenshot_disabled_hint"),
+            )
+            return
+
+        if _screenshot_selector[0] is not None:
+            return
+        if _screenshot_translation_overlay[0] is not None:
+            _screenshot_translation_overlay[0].close()
+            _screenshot_translation_overlay[0] = None
+        _overlay_was_visible[0] = overlay.isVisible()
+        if _overlay_was_visible[0]:
+            overlay.hide()
+
+        selector = ScreenRegionSelector()
+        _screenshot_selector[0] = selector
+
+        def on_selected(image, screen_rect):
+            # Keep the live subtitle overlay hidden while the review layer is
+            # active.  It is also a topmost window, so restoring it here can
+            # put it above the dimmed screenshot and action controls.
+            selector.begin_review(image, screen_rect)
+            if selector.should_auto_translate():
+                selector.begin_processing()
+
+        def on_translate_requested(image):
+            live_trans.translate_screenshot(image, selector)
+
+        def on_paste_requested(translated_image, screen_rect):
+            if _screenshot_translation_overlay[0] is not None:
+                _screenshot_translation_overlay[0].close()
+            translation_overlay = ScreenshotTranslationOverlay(screen_rect)
+            _screenshot_translation_overlay[0] = translation_overlay
+
+            def _clear_translation_overlay(*_args):
+                if _screenshot_translation_overlay[0] is translation_overlay:
+                    _screenshot_translation_overlay[0] = None
+
+            translation_overlay.destroyed.connect(_clear_translation_overlay)
+            _restore_overlay_after_screenshot()
+            translation_overlay.set_result(translated_image)
+            if _screenshot_selector[0] is selector:
+                _screenshot_selector[0] = None
+            selector.close()
+
+        def on_cancelled():
+            _restore_overlay_after_screenshot()
+            _screenshot_selector[0] = None
+
+        selector.selection_finished.connect(on_selected)
+        selector.selection_cancelled.connect(on_cancelled)
+        selector.translate_requested.connect(on_translate_requested)
+        selector.paste_requested.connect(on_paste_requested)
+        selector.show()
+        selector.raise_()
+        selector.activateWindow()
+
+    overlay.screenshot_requested.connect(_on_screenshot_requested)
+    subwin.screenshot_requested.connect(_on_screenshot_requested)
 
     def _deferred_init():
         panel._apply_settings()
@@ -1954,6 +2615,11 @@ def main():
     overlay_toggle_action.triggered.connect(on_toggle_overlay)
     menu.addAction(overlay_toggle_action)
 
+    screenshot_action = QAction(t("screenshot"))
+    screenshot_action.setToolTip(t("screenshot_hint"))
+    screenshot_action.triggered.connect(_on_screenshot_requested)
+    menu.addAction(screenshot_action)
+
     # --- Subtitle window toggle ---
     def _save_overlay_pos():
         settings = panel.get_settings()
@@ -1980,8 +2646,16 @@ def main():
         pos = subwin.pos()
         sm["window_x"] = pos.x()
         sm["window_y"] = pos.y()
+        sm["window_width"] = subwin.width()
+        sm["window_height"] = subwin.height()
         settings["subtitle_mode"] = sm
         panel._current_settings["subtitle_mode"] = sm
+        if hasattr(panel, "_subtitle_widget"):
+            subtitle_widget = panel._subtitle_widget
+            subtitle_widget._settings.update(sm)
+            subtitle_widget._width_spin.blockSignals(True)
+            subtitle_widget._width_spin.setValue(subwin.width())
+            subtitle_widget._width_spin.blockSignals(False)
         _save_settings(settings)
 
     _subwin_notified = [False]
@@ -2015,6 +2689,29 @@ def main():
         _save_subwin_state()
 
     subwin.window_closed.connect(_on_subwin_closed)
+
+    def _on_subwin_options_changed(changes):
+        settings = panel.get_settings()
+        sm = settings.get("subtitle_mode") or {}
+        sm.update(changes)
+        settings["subtitle_mode"] = sm
+        panel._current_settings["subtitle_mode"] = sm
+        if hasattr(panel, "_subtitle_widget"):
+            widget = panel._subtitle_widget
+            widget._settings.update(changes)
+            for key, control in (
+                ("always_on_top", widget._always_on_top_check),
+                ("locked", widget._locked_check),
+                ("click_through", widget._click_through_check),
+            ):
+                if key not in changes:
+                    continue
+                control.blockSignals(True)
+                control.setChecked(bool(sm.get(key, False)))
+                control.blockSignals(False)
+        _save_settings(settings)
+
+    subwin.window_options_changed.connect(_on_subwin_options_changed)
 
     # Restore subtitle window visibility from saved state
     if subwin_was_enabled:
@@ -2083,12 +2780,37 @@ def main():
             log_window.show()
             log_window.raise_()
 
+    def _bring_panel_to_front():
+        """Open the regular settings window without retaining a topmost flag."""
+        # A regular window cannot be shown over the subtitle overlay while that
+        # overlay is topmost. Lower the overlay only while Settings is visible.
+        if (
+            overlay.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
+        ):
+            _restore_overlay_topmost_after_panel[0] = True
+            overlay._set_topmost(False)
+        panel.setWindowState(
+            panel.windowState() & ~Qt.WindowState.WindowMinimized
+        )
+        panel.show()
+        panel.raise_()
+        panel.activateWindow()
+        panel.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+
+        # Windows can defer z-order changes until after this slot returns.
+        QTimer.singleShot(0, panel.raise_)
+        QTimer.singleShot(0, panel.activateWindow)
+
     def on_toggle_panel():
-        if panel.isVisible():
+        if panel.isVisible() and panel.isActiveWindow():
             panel.hide()
-        else:
-            panel.show()
-            panel.raise_()
+            return
+        _bring_panel_to_front()
+
+    def on_show_panel():
+        """Always open settings when the overlay's Settings button is clicked."""
+        log.info("Settings requested from the subtitle overlay")
+        _bring_panel_to_front()
 
     log_action.triggered.connect(on_toggle_log)
     panel_action.triggered.connect(on_toggle_panel)
@@ -2286,6 +3008,12 @@ def main():
     quit_action = QAction(t("quit"))
 
     def on_quit():
+        if _screenshot_selector[0] is not None:
+            _screenshot_selector[0].close()
+            _screenshot_selector[0] = None
+        if _screenshot_translation_overlay[0] is not None:
+            _screenshot_translation_overlay[0].close()
+            _screenshot_translation_overlay[0] = None
         live_trans.stop()
         app.quit()
 
@@ -2293,7 +3021,7 @@ def main():
     menu.addAction(quit_action)
 
     # --- Connect overlay signals ---
-    overlay.settings_requested.connect(on_toggle_panel)
+    overlay.settings_requested.connect(on_show_panel)
     overlay.target_language_changed.connect(live_trans._on_target_language_changed)
 
     def _on_overlay_source_lang(code):

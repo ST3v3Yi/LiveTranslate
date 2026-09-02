@@ -1,17 +1,21 @@
 import json
 import logging
 import os
+import platform
 import threading
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QPoint, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QColorDialog,
     QComboBox,
+    QCheckBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFontComboBox,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -25,6 +29,7 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QTabWidget,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -47,14 +52,150 @@ from model_manager import (
     list_local_faster_whisper_models,
     migrate_funasr_settings,
     normalize_funasr_model_key,
+    qwen3_asr_defaults,
     resolve_custom_whisper_model,
 )
+from term_glossary import TermGlossary
 from i18n import t, LANGUAGES
 from subtitle_settings import SubtitleSettingsWidget
 
 log = logging.getLogger("LiveTranslate.Panel")
 
 SETTINGS_FILE = Path(__file__).parent / "user_settings.json"
+_GLOSSARY_READY_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+
+
+def _local_cpu_name() -> str:
+    """Return a readable CPU name without requiring an external command."""
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, "ProcessorNameString")
+            if value:
+                return str(value).strip()
+    except (ImportError, OSError):
+        pass
+    return platform.processor().strip() or "CPU"
+
+
+def _available_ocr_devices() -> list[tuple[str, str]]:
+    """Map friendly OCR device labels to the PaddleX device strings."""
+    devices = []
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            for index in range(torch.cuda.device_count()):
+                name = torch.cuda.get_device_name(index).strip()
+                devices.append((f"{name} (GPU)", f"gpu:{index}"))
+    except (ImportError, RuntimeError):
+        pass
+    devices.append((f"{_local_cpu_name()} (CPU)", "cpu"))
+    return devices
+
+
+class HoverInfoButton(QToolButton):
+    """Information icon backed by an app-owned hover popup."""
+
+    def __init__(self, help_text: str, parent=None):
+        super().__init__(parent)
+        self._help_text = help_text
+        self.setText("ⓘ")
+        self.setAutoRaise(True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setMouseTracking(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setFixedSize(26, 26)
+        # Keep the standard property for accessibility and keyboard help events;
+        # the visible popup below does not rely on the platform tooltip service.
+        self.setToolTip(help_text)
+
+        self._popup = QFrame(self)
+        self._popup.setObjectName("hoverHelpPopup")
+        self._popup.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+        self._popup.setStyleSheet(
+            "QFrame#hoverHelpPopup {"
+            " background-color: #fffbe6; color: #202020;"
+            " border: 1px solid #8a8a8a; border-radius: 5px;"
+            "}"
+            "QFrame#hoverHelpPopup QLabel { color: #202020; border: none; }"
+        )
+        popup_layout = QVBoxLayout(self._popup)
+        popup_layout.setContentsMargins(10, 8, 10, 8)
+        self._help_label = QLabel(help_text)
+        self._help_label.setTextFormat(Qt.TextFormat.RichText)
+        self._help_label.setWordWrap(True)
+        self._help_label.setFixedWidth(420)
+        popup_layout.addWidget(self._help_label)
+
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self._popup.hide)
+        self.clicked.connect(self._toggle_help)
+
+    def _show_help(self):
+        if not self.isVisible() or not self._help_text:
+            return
+        host = self.window()
+        if self._popup.parentWidget() is not host:
+            self._popup.setParent(host)
+        self._help_label.setFixedWidth(max(260, min(420, host.width() - 40)))
+        self._popup.layout().activate()
+        self._popup.resize(self._popup.sizeHint())
+
+        anchor = self.mapTo(host, QPoint(0, self.height() + 4))
+        margin = 8
+        x = min(
+            max(anchor.x(), margin),
+            max(margin, host.width() - self._popup.width() - margin),
+        )
+        y = anchor.y()
+        if y + self._popup.height() > host.height() - margin:
+            y = self.mapTo(host, QPoint(0, -self._popup.height() - 4)).y()
+        y = min(
+            max(y, margin),
+            max(margin, host.height() - self._popup.height() - margin),
+        )
+        self._popup.move(x, y)
+        self._popup.show()
+        self._popup.raise_()
+        self._hide_timer.start(20000)
+
+    def _toggle_help(self):
+        if self._popup.isVisible():
+            self._popup.hide()
+            self._hide_timer.stop()
+        else:
+            self._show_help()
+
+    def _hide_if_pointer_left(self):
+        if not self.underMouse():
+            self._popup.hide()
+            self._hide_timer.stop()
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self._hide_timer.stop()
+        # Defer until Qt has completed the enter event so geometry and screen
+        # placement are final before the popup is positioned.
+        QTimer.singleShot(0, self._show_help)
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        QTimer.singleShot(180, self._hide_if_pointer_left)
+
+    def event(self, event):
+        if event.type() == QEvent.Type.ToolTip:
+            self._show_help()
+            event.accept()
+            return True
+        return super().event(event)
 
 
 def _load_saved_settings() -> dict | None:
@@ -91,6 +232,7 @@ class ControlPanel(QWidget):
     _bench_result = pyqtSignal(str)
     _cache_result = pyqtSignal(list)
     reset_positions = pyqtSignal()
+    visibility_changed = pyqtSignal(bool)
 
     def __init__(self, config, saved_settings=None):
         super().__init__()
@@ -108,6 +250,17 @@ class ControlPanel(QWidget):
                 "vad_mode": "silero",
                 "vad_threshold": config["asr"]["vad_threshold"],
                 "energy_threshold": 0.02,
+                "firered_vad_model_path": r"D:\Models\FireRedVAD\Stream-VAD",
+                "firered_threshold": 0.5,
+                "firered_smooth_window": 5,
+                "firered_pad_start_frames": 5,
+                "firered_min_speech_frames": 8,
+                "firered_min_silence_frames": 20,
+                "vad_pre_roll_ms": 160,
+                "vad_adaptive_silence_min": 0.3,
+                "vad_adaptive_silence_max": 2.0,
+                "vad_split_tail_guard": 0.5,
+                "vad_progressive_split": True,
                 "min_speech_duration": config["asr"]["min_speech_duration"],
                 "max_speech_duration": config["asr"]["max_speech_duration"],
                 "silence_mode": "auto",
@@ -163,6 +316,54 @@ class ControlPanel(QWidget):
             "whisper_pad_seconds",
             config["asr"].get("whisper_pad_seconds", 0.5),
         )
+        qwen_defaults = qwen3_asr_defaults()
+        self._current_settings.setdefault("qwen3_python", qwen_defaults["python"])
+        self._current_settings.setdefault("qwen3_project", qwen_defaults["project"])
+        self._current_settings.setdefault("qwen3_model_path", qwen_defaults["model"])
+        self._current_settings.setdefault("qwen3_context_turns", 3)
+        self._current_settings.setdefault("qwen3_max_new_tokens", 128)
+        self._current_settings.setdefault("qwen3_hotwords", "")
+        self._current_settings.setdefault("qwen3_refine_enabled", False)
+        self._current_settings.setdefault(
+            "firered_vad_model_path", r"D:\Models\FireRedVAD\Stream-VAD"
+        )
+        self._current_settings.setdefault(
+            "firered_threshold", self._current_settings.get("vad_threshold", 0.5)
+        )
+        self._current_settings.setdefault("firered_smooth_window", 5)
+        self._current_settings.setdefault("firered_pad_start_frames", 5)
+        self._current_settings.setdefault("firered_min_speech_frames", 8)
+        self._current_settings.setdefault("firered_min_silence_frames", 20)
+        self._current_settings.setdefault("vad_pre_roll_ms", 160)
+        self._current_settings.setdefault("vad_adaptive_silence_min", 0.3)
+        self._current_settings.setdefault("vad_adaptive_silence_max", 2.0)
+        self._current_settings.setdefault("vad_split_tail_guard", 0.5)
+        self._current_settings.setdefault("vad_progressive_split", True)
+        self._current_settings.setdefault(
+            "glossary_enabled",
+            config["translation"].get("glossary_enabled", True),
+        )
+        ocr_defaults = config.get("ocr") or {}
+        self._current_settings.setdefault(
+            "ocr_enabled", ocr_defaults.get("enabled", True)
+        )
+        self._current_settings.setdefault("ocr_python", ocr_defaults.get("python", ""))
+        self._current_settings.setdefault(
+            "ocr_model_path", ocr_defaults.get("model_path", "")
+        )
+        self._current_settings.setdefault(
+            "ocr_device", ocr_defaults.get("device", "gpu:0")
+        )
+        self._current_settings.setdefault(
+            "ocr_cache_dir", ocr_defaults.get("cache_dir", "paddlex_cache")
+        )
+        if "glossary_paths" not in self._current_settings:
+            default_glossary = config["translation"].get("glossary_path")
+            self._current_settings["glossary_paths"] = (
+                [str(self._resolve_path(default_glossary))]
+                if default_glossary
+                else []
+            )
 
         layout = QVBoxLayout(self)
         tabs = QTabWidget()
@@ -204,6 +405,7 @@ class ControlPanel(QWidget):
         widget = QWidget()
         layout = QVBoxLayout(widget)
         s = self._current_settings
+        qwen_defaults = qwen3_asr_defaults()
 
         asr_group = QGroupBox(t("group_asr_engine"))
         asr_layout = QGridLayout(asr_group)
@@ -218,6 +420,7 @@ class ControlPanel(QWidget):
                 f"[{t('asr_fast')}] FunASR",
                 "Anime-Whisper (ja, anime/galgame)",
                 "Remote Whisper (remote GPU server)",
+                "Qwen3-ASR (local Transformers)",
             ]
         )
         engine_map_idx = {
@@ -225,6 +428,7 @@ class ControlPanel(QWidget):
             "funasr": 1,
             "anime-whisper": 2,
             "remote-whisper": 3,
+            "qwen3-asr": 4,
         }
         engine_idx = engine_map_idx.get(s.get("asr_engine"), 0)
         self._asr_engine.setCurrentIndex(engine_idx)
@@ -420,19 +624,84 @@ class ControlPanel(QWidget):
         layout.addWidget(self._remote_group)
         self._remote_group.setVisible(engine_idx == 3)
 
+        self._qwen3_group = QGroupBox(t("group_qwen3_asr"))
+        qwen3_layout = QGridLayout(self._qwen3_group)
+        self._qwen3_model_path = QLineEdit(s.get("qwen3_model_path", ""))
+        self._qwen3_model_path.setPlaceholderText(qwen_defaults["model"])
+        self._qwen3_python = QLineEdit(s.get("qwen3_python", ""))
+        self._qwen3_python.setPlaceholderText(qwen_defaults["python"])
+        self._qwen3_project = QLineEdit(s.get("qwen3_project", ""))
+        self._qwen3_project.setPlaceholderText(qwen_defaults["project"])
+        qwen3_layout.addWidget(QLabel(t("label_qwen3_model_path")), 0, 0)
+        qwen3_layout.addWidget(self._qwen3_model_path, 0, 1)
+        qwen3_layout.addWidget(QLabel(t("label_qwen3_python")), 1, 0)
+        qwen3_layout.addWidget(self._qwen3_python, 1, 1)
+        qwen3_layout.addWidget(QLabel(t("label_qwen3_project")), 2, 0)
+        qwen3_layout.addWidget(self._qwen3_project, 2, 1)
+        self._qwen3_context_turns = QSpinBox()
+        self._qwen3_context_turns.setRange(0, 8)
+        self._qwen3_context_turns.setValue(int(s.get("qwen3_context_turns", 3)))
+        self._qwen3_context_turns.setToolTip(t("qwen3_context_turns_hint"))
+        self._qwen3_context_turns.valueChanged.connect(self._auto_save)
+        qwen3_layout.addWidget(QLabel(t("label_qwen3_context_turns")), 3, 0)
+        qwen3_layout.addWidget(self._qwen3_context_turns, 3, 1)
+
+        self._qwen3_max_new_tokens = QSpinBox()
+        self._qwen3_max_new_tokens.setRange(32, 256)
+        self._qwen3_max_new_tokens.setSingleStep(16)
+        self._qwen3_max_new_tokens.setValue(int(s.get("qwen3_max_new_tokens", 128)))
+        self._qwen3_max_new_tokens.setToolTip(t("qwen3_max_new_tokens_hint"))
+        self._qwen3_max_new_tokens.valueChanged.connect(self._auto_save)
+        qwen3_layout.addWidget(QLabel(t("label_qwen3_max_new_tokens")), 4, 0)
+        qwen3_layout.addWidget(self._qwen3_max_new_tokens, 4, 1)
+
+        self._qwen3_refine_enabled = QCheckBox(t("label_qwen3_refine"))
+        self._qwen3_refine_enabled.setChecked(
+            s.get("qwen3_refine_enabled", False)
+        )
+        self._qwen3_refine_enabled.setToolTip(t("qwen3_refine_hint"))
+        self._qwen3_refine_enabled.toggled.connect(self._auto_save)
+
+        self._glossary_enabled_cb = QCheckBox(t("label_enable_glossary"))
+        self._glossary_enabled_cb.setChecked(s.get("glossary_enabled", True))
+        glossary_tooltip = t("glossary_enabled_tooltip")
+        self._glossary_enabled_cb.setToolTip(glossary_tooltip)
+        self._glossary_enabled_cb.toggled.connect(
+            self._on_glossary_enabled_changed
+        )
+
+        feature_toggle_row = QHBoxLayout()
+        feature_toggle_row.addWidget(self._qwen3_refine_enabled)
+        feature_toggle_row.addWidget(self._glossary_enabled_cb)
+        feature_toggle_row.addStretch()
+        qwen3_layout.addLayout(feature_toggle_row, 5, 0, 1, 2)
+
+        self._qwen3_hotwords = QLineEdit(s.get("qwen3_hotwords", ""))
+        self._qwen3_hotwords.setPlaceholderText(t("qwen3_hotwords_placeholder"))
+        self._qwen3_hotwords.setToolTip(t("qwen3_hotwords_hint"))
+        self._qwen3_hotwords.editingFinished.connect(self._auto_save)
+        qwen3_layout.addWidget(QLabel(t("label_qwen3_hotwords")), 6, 0)
+        qwen3_layout.addWidget(self._qwen3_hotwords, 6, 1)
+        for edit in (self._qwen3_model_path, self._qwen3_python, self._qwen3_project):
+            edit.editingFinished.connect(self._auto_save)
+        layout.addWidget(self._qwen3_group)
+        self._qwen3_group.setVisible(engine_idx == 4)
+
         mode_group = QGroupBox(t("group_vad_mode"))
         mode_layout = QVBoxLayout(mode_group)
         self._vad_mode = QComboBox()
-        self._vad_mode.addItems([t("vad_silero"), t("vad_energy"), t("vad_disabled")])
-        mode_map = {"silero": 0, "energy": 1, "disabled": 2}
+        self._vad_mode.addItems(
+            [t("vad_silero"), t("vad_firered"), t("vad_energy"), t("vad_disabled")]
+        )
+        mode_map = {"silero": 0, "firered": 1, "energy": 2, "disabled": 3}
         self._vad_mode.setCurrentIndex(mode_map.get(s.get("vad_mode", "energy"), 1))
         self._vad_mode.currentIndexChanged.connect(self._on_vad_mode_changed)
         self._vad_mode.currentIndexChanged.connect(self._auto_save)
         mode_layout.addWidget(self._vad_mode)
         layout.addWidget(mode_group)
 
-        silero_group = QGroupBox(t("group_silero_threshold"))
-        silero_layout = QGridLayout(silero_group)
+        self._silero_group = QGroupBox(t("group_silero_threshold"))
+        silero_layout = QGridLayout(self._silero_group)
         self._vad_threshold_slider = QSlider(Qt.Orientation.Horizontal)
         self._vad_threshold_slider.setRange(0, 100)
         vad_pct = int(s.get("vad_threshold", 0.5) * 100)
@@ -444,10 +713,69 @@ class ControlPanel(QWidget):
         silero_layout.addWidget(QLabel(t("label_threshold")), 0, 0)
         silero_layout.addWidget(self._vad_threshold_slider, 0, 1)
         silero_layout.addWidget(self._vad_threshold_label, 0, 2)
-        layout.addWidget(silero_group)
+        layout.addWidget(self._silero_group)
 
-        energy_group = QGroupBox(t("group_energy_threshold"))
-        energy_layout = QGridLayout(energy_group)
+        self._firered_group = QGroupBox(t("group_firered_vad"))
+        firered_layout = QGridLayout(self._firered_group)
+        self._firered_model_path = QLineEdit(
+            s.get("firered_vad_model_path", r"D:\Models\FireRedVAD\Stream-VAD")
+        )
+        self._firered_model_path.setToolTip(t("firered_vad_path_hint"))
+        self._firered_model_path.editingFinished.connect(self._auto_save)
+        firered_layout.addWidget(QLabel(t("label_firered_vad_path")), 0, 0)
+        firered_layout.addWidget(self._firered_model_path, 0, 1)
+        self._firered_threshold_slider = QSlider(Qt.Orientation.Horizontal)
+        self._firered_threshold_slider.setRange(1, 99)
+        firered_pct = int(s.get("firered_threshold", 0.5) * 100)
+        self._firered_threshold_slider.setValue(firered_pct)
+        self._firered_threshold_slider.valueChanged.connect(
+            self._on_firered_threshold_changed
+        )
+        self._firered_threshold_slider.sliderReleased.connect(self._auto_save)
+        self._firered_threshold_label = QLabel(f"{firered_pct}%")
+        self._firered_threshold_label.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
+        firered_layout.addWidget(QLabel(t("label_firered_threshold")), 1, 0)
+        firered_layout.addWidget(self._firered_threshold_slider, 1, 1)
+        firered_layout.addWidget(self._firered_threshold_label, 1, 2)
+        self._firered_smooth_window = QSpinBox()
+        self._firered_smooth_window.setRange(1, 15)
+        self._firered_smooth_window.setValue(s.get("firered_smooth_window", 5))
+        self._firered_pad_start_frames = QSpinBox()
+        self._firered_pad_start_frames.setRange(0, 30)
+        self._firered_pad_start_frames.setValue(
+            s.get("firered_pad_start_frames", 5)
+        )
+        self._firered_min_speech_frames = QSpinBox()
+        self._firered_min_speech_frames.setRange(1, 50)
+        self._firered_min_speech_frames.setValue(
+            s.get("firered_min_speech_frames", 8)
+        )
+        self._firered_min_silence_frames = QSpinBox()
+        self._firered_min_silence_frames.setRange(1, 100)
+        self._firered_min_silence_frames.setValue(
+            s.get("firered_min_silence_frames", 20)
+        )
+        for control in (
+            self._firered_smooth_window,
+            self._firered_pad_start_frames,
+            self._firered_min_speech_frames,
+            self._firered_min_silence_frames,
+        ):
+            control.valueChanged.connect(self._on_timing_changed)
+            control.valueChanged.connect(self._auto_save)
+        firered_layout.addWidget(QLabel(t("label_firered_smooth")), 2, 0)
+        firered_layout.addWidget(self._firered_smooth_window, 2, 1)
+        firered_layout.addWidget(QLabel(t("label_firered_pad_start")), 3, 0)
+        firered_layout.addWidget(self._firered_pad_start_frames, 3, 1)
+        firered_layout.addWidget(QLabel(t("label_firered_min_speech")), 4, 0)
+        firered_layout.addWidget(self._firered_min_speech_frames, 4, 1)
+        firered_layout.addWidget(QLabel(t("label_firered_min_silence")), 5, 0)
+        firered_layout.addWidget(self._firered_min_silence_frames, 5, 1)
+        layout.addWidget(self._firered_group)
+        self._firered_group.setVisible(s.get("vad_mode", "energy") == "firered")
+
+        self._energy_group = QGroupBox(t("group_energy_threshold"))
+        energy_layout = QGridLayout(self._energy_group)
         self._energy_slider = QSlider(Qt.Orientation.Horizontal)
         self._energy_slider.setRange(1, 100)
         energy_pm = int(s.get("energy_threshold", 0.03) * 1000)
@@ -459,7 +787,8 @@ class ControlPanel(QWidget):
         energy_layout.addWidget(QLabel(t("label_threshold")), 0, 0)
         energy_layout.addWidget(self._energy_slider, 0, 1)
         energy_layout.addWidget(self._energy_label, 0, 2)
-        layout.addWidget(energy_group)
+        layout.addWidget(self._energy_group)
+        self._update_vad_mode_visibility(s.get("vad_mode", "silero"))
 
         timing_group = QGroupBox(t("group_timing"))
         timing_layout = QGridLayout(timing_group)
@@ -505,8 +834,6 @@ class ControlPanel(QWidget):
         timing_layout.addWidget(QLabel(t("label_silence_dur")), 3, 0)
         timing_layout.addWidget(self._silence_duration, 3, 1)
 
-        from PyQt6.QtWidgets import QCheckBox
-
         self._incremental_asr_cb = QCheckBox(t("label_incremental_asr"))
         self._incremental_asr_cb.setToolTip(t("incremental_asr_tooltip"))
         self._incremental_asr_cb.setChecked(s.get("incremental_asr", False))
@@ -527,6 +854,47 @@ class ControlPanel(QWidget):
         timing_layout.addWidget(self._interim_interval_spin, 5, 1)
 
         layout.addWidget(timing_group)
+
+        advanced_vad_group = QGroupBox(t("group_vad_advanced"))
+        advanced_vad_layout = QGridLayout(advanced_vad_group)
+        self._vad_pre_roll_ms = QSpinBox()
+        self._vad_pre_roll_ms.setRange(0, 500)
+        self._vad_pre_roll_ms.setSingleStep(20)
+        self._vad_pre_roll_ms.setValue(s.get("vad_pre_roll_ms", 160))
+        self._vad_adaptive_min = QDoubleSpinBox()
+        self._vad_adaptive_min.setRange(0.1, 2.0)
+        self._vad_adaptive_min.setSingleStep(0.1)
+        self._vad_adaptive_min.setValue(s.get("vad_adaptive_silence_min", 0.3))
+        self._vad_adaptive_max = QDoubleSpinBox()
+        self._vad_adaptive_max.setRange(0.2, 5.0)
+        self._vad_adaptive_max.setSingleStep(0.1)
+        self._vad_adaptive_max.setValue(s.get("vad_adaptive_silence_max", 2.0))
+        self._vad_split_tail_guard = QDoubleSpinBox()
+        self._vad_split_tail_guard.setRange(0.0, 2.0)
+        self._vad_split_tail_guard.setSingleStep(0.1)
+        self._vad_split_tail_guard.setValue(s.get("vad_split_tail_guard", 0.5))
+        self._vad_progressive_split = QCheckBox(t("label_vad_progressive_split"))
+        self._vad_progressive_split.setChecked(s.get("vad_progressive_split", True))
+        for control in (
+            self._vad_pre_roll_ms,
+            self._vad_adaptive_min,
+            self._vad_adaptive_max,
+            self._vad_split_tail_guard,
+        ):
+            control.valueChanged.connect(self._on_timing_changed)
+            control.valueChanged.connect(self._auto_save)
+        self._vad_progressive_split.toggled.connect(self._on_timing_changed)
+        self._vad_progressive_split.toggled.connect(self._auto_save)
+        advanced_vad_layout.addWidget(QLabel(t("label_vad_pre_roll")), 0, 0)
+        advanced_vad_layout.addWidget(self._vad_pre_roll_ms, 0, 1)
+        advanced_vad_layout.addWidget(QLabel(t("label_vad_adaptive_min")), 1, 0)
+        advanced_vad_layout.addWidget(self._vad_adaptive_min, 1, 1)
+        advanced_vad_layout.addWidget(QLabel(t("label_vad_adaptive_max")), 2, 0)
+        advanced_vad_layout.addWidget(self._vad_adaptive_max, 2, 1)
+        advanced_vad_layout.addWidget(QLabel(t("label_vad_tail_guard")), 3, 0)
+        advanced_vad_layout.addWidget(self._vad_split_tail_guard, 3, 1)
+        advanced_vad_layout.addWidget(self._vad_progressive_split, 4, 0, 1, 2)
+        layout.addWidget(advanced_vad_group)
 
         layout.addStretch()
         return widget
@@ -562,6 +930,100 @@ class ControlPanel(QWidget):
         btn_row.addWidget(del_btn)
         models_layout.addLayout(btn_row)
         layout.addWidget(models_group)
+
+        glossary_group = QGroupBox(t("group_term_glossaries"))
+        glossary_layout = QVBoxLayout(glossary_group)
+
+        self._glossary_list = QListWidget()
+        self._glossary_list.setMaximumHeight(100)
+        self._glossary_list.currentItemChanged.connect(
+            self._on_glossary_selection_changed
+        )
+        glossary_layout.addWidget(self._glossary_list)
+
+        self._glossary_status = QLabel("")
+        self._glossary_status.setWordWrap(True)
+        self._glossary_status.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        glossary_layout.addWidget(self._glossary_status)
+
+        self._glossary_path_view = QLineEdit()
+        self._glossary_path_view.setReadOnly(True)
+        glossary_layout.addWidget(self._glossary_path_view)
+
+        glossary_btn_row = QHBoxLayout()
+        self._add_glossary_btn = QPushButton(t("btn_add_glossary"))
+        self._add_glossary_btn.clicked.connect(self._add_glossary)
+        glossary_btn_row.addWidget(self._add_glossary_btn)
+        self._remove_glossary_btn = QPushButton(t("btn_remove_glossary"))
+        self._remove_glossary_btn.setToolTip(t("remove_glossary_hint"))
+        self._remove_glossary_btn.clicked.connect(self._remove_glossary)
+        glossary_btn_row.addWidget(self._remove_glossary_btn)
+        self._reload_glossary_btn = QPushButton(t("btn_reload_glossaries"))
+        self._reload_glossary_btn.clicked.connect(self._reload_glossary_list)
+        glossary_btn_row.addWidget(self._reload_glossary_btn)
+        self._open_glossary_file_btn = QPushButton(t("btn_open_glossary_file"))
+        self._open_glossary_file_btn.clicked.connect(self._open_glossary_file)
+        glossary_btn_row.addWidget(self._open_glossary_file_btn)
+        self._open_glossary_folder_btn = QPushButton(
+            t("btn_open_glossary_folder")
+        )
+        self._open_glossary_folder_btn.clicked.connect(self._open_glossary_folder)
+        glossary_btn_row.addWidget(self._open_glossary_folder_btn)
+        glossary_btn_row.addStretch()
+        glossary_layout.addLayout(glossary_btn_row)
+        self._refresh_glossary_list()
+        layout.addWidget(glossary_group)
+
+        ocr_group = QGroupBox(t("group_ocr_screenshot"))
+        ocr_layout = QGridLayout(ocr_group)
+        ocr_layout.setColumnStretch(1, 1)
+
+        self._ocr_enabled_cb = QCheckBox(t("label_enable_ocr_screenshot"))
+        self._ocr_enabled_cb.setChecked(bool(s.get("ocr_enabled", True)))
+        self._ocr_enabled_cb.setToolTip(t("ocr_screenshot_tooltip"))
+        self._ocr_enabled_cb.toggled.connect(self._on_ocr_enabled_changed)
+        ocr_layout.addWidget(self._ocr_enabled_cb, 0, 0, 1, 2)
+
+        self._ocr_python_edit = QLineEdit(s.get("ocr_python", ""))
+        self._ocr_python_edit.setPlaceholderText("C:/.../envs/paddleocr-vl/python.exe")
+        ocr_layout.addWidget(QLabel(t("label_ocr_python")), 1, 0)
+        ocr_layout.addWidget(self._ocr_python_edit, 1, 1)
+
+        self._ocr_model_path_edit = QLineEdit(s.get("ocr_model_path", ""))
+        self._ocr_model_path_edit.setPlaceholderText("D:/Models/PaddleOCR-VL-1.6")
+        ocr_layout.addWidget(QLabel(t("label_ocr_model_path")), 2, 0)
+        ocr_layout.addWidget(self._ocr_model_path_edit, 2, 1)
+
+        self._ocr_device_combo = QComboBox()
+        saved_ocr_device = str(s.get("ocr_device", "gpu:0")).strip() or "gpu:0"
+        for label, device in _available_ocr_devices():
+            self._ocr_device_combo.addItem(label, device)
+        device_index = self._ocr_device_combo.findData(saved_ocr_device)
+        if device_index < 0:
+            # Keep an unavailable saved selection without exposing its raw ID.
+            self._ocr_device_combo.addItem(t("ocr_device_unavailable"), saved_ocr_device)
+            device_index = self._ocr_device_combo.count() - 1
+        self._ocr_device_combo.setCurrentIndex(device_index)
+        self._ocr_device_combo.currentIndexChanged.connect(self._apply_settings)
+        self._ocr_device_combo.currentIndexChanged.connect(self._auto_save)
+        ocr_layout.addWidget(QLabel(t("label_ocr_device")), 3, 0)
+        ocr_layout.addWidget(self._ocr_device_combo, 3, 1)
+
+        self._ocr_cache_dir_edit = QLineEdit(s.get("ocr_cache_dir", "paddlex_cache"))
+        self._ocr_cache_dir_edit.setPlaceholderText("paddlex_cache")
+        ocr_layout.addWidget(QLabel(t("label_ocr_cache_dir")), 4, 0)
+        ocr_layout.addWidget(self._ocr_cache_dir_edit, 4, 1)
+
+        for edit in (
+            self._ocr_python_edit,
+            self._ocr_model_path_edit,
+            self._ocr_cache_dir_edit,
+        ):
+            edit.editingFinished.connect(self._apply_settings)
+            edit.editingFinished.connect(self._auto_save)
+        layout.addWidget(ocr_group)
 
         prompt_group = QGroupBox(t("group_system_prompt"))
         prompt_layout = QVBoxLayout(prompt_group)
@@ -814,6 +1276,16 @@ class ControlPanel(QWidget):
         self._window_opacity.valueChanged.connect(self._on_style_value_changed)
         self._window_opacity.valueChanged.connect(self._auto_save)
         win_layout.addWidget(self._window_opacity, 0, 1)
+        win_layout.addWidget(QLabel(t("label_performance_scope")), 1, 0)
+        self._performance_scope = QComboBox()
+        self._performance_scope.addItem(t("performance_scope_application"), "application")
+        self._performance_scope.addItem(t("performance_scope_system"), "system")
+        scope_index = self._performance_scope.findData(
+            s.get("performance_scope", DEFAULT_STYLE["performance_scope"])
+        )
+        self._performance_scope.setCurrentIndex(max(0, scope_index))
+        self._performance_scope.currentIndexChanged.connect(self._auto_save)
+        win_layout.addWidget(self._performance_scope, 1, 1)
         layout.addWidget(win_group)
 
         layout.addStretch()
@@ -858,6 +1330,7 @@ class ControlPanel(QWidget):
             "translation_color": self._trans_color_btn.property("hex_color"),
             "timestamp_color": self._ts_color_btn.property("hex_color"),
             "window_opacity": self._window_opacity.value(),
+            "performance_scope": self._performance_scope.currentData() or "application",
         }
 
     def _apply_style_to_controls(self, s: dict):
@@ -890,6 +1363,10 @@ class ControlPanel(QWidget):
             f"background-color: {s['timestamp_color']}; border: 1px solid #888; border-radius: 3px;"
         )
         self._window_opacity.setValue(s["window_opacity"])
+        scope_index = self._performance_scope.findData(
+            s.get("performance_scope", "application")
+        )
+        self._performance_scope.setCurrentIndex(max(0, scope_index))
 
     def _on_preset_changed(self, index):
         from subtitle_overlay import STYLE_PRESETS
@@ -935,6 +1412,7 @@ class ControlPanel(QWidget):
             self._orig_font_size,
             self._trans_font_size,
             self._window_opacity,
+            self._performance_scope,
         ):
             w.blockSignals(block)
 
@@ -1133,6 +1611,8 @@ class ControlPanel(QWidget):
             self._sensevoice_pad_seconds.setVisible(show_funasr_pad)
         if hasattr(self, "_remote_group"):
             self._remote_group.setVisible(index == 3)
+        if hasattr(self, "_qwen3_group"):
+            self._qwen3_group.setVisible(index == 4)
         # Resize window to fit content after whisper group visibility change
         QTimer.singleShot(0, self._fit_height)
 
@@ -1356,18 +1836,224 @@ class ControlPanel(QWidget):
 
     # ── Shared logic ──
 
+    @staticmethod
+    def _resolve_path(value) -> Path:
+        path = Path(str(value))
+        if not path.is_absolute():
+            path = Path(__file__).parent / path
+        return path.resolve()
+
+    def _glossary_paths(self):
+        output = []
+        seen = set()
+        for value in self._current_settings.get("glossary_paths", []):
+            path = self._resolve_path(value)
+            key = str(path).casefold()
+            if key not in seen:
+                output.append(path)
+                seen.add(key)
+        return output
+
+    def _on_glossary_enabled_changed(self, enabled: bool):
+        self._current_settings["glossary_enabled"] = bool(enabled)
+        self._refresh_glossary_list()
+        self._apply_settings()
+        _save_settings(self._current_settings)
+
+    def _on_ocr_enabled_changed(self, enabled: bool):
+        self._current_settings["ocr_enabled"] = bool(enabled)
+        self._apply_settings()
+        _save_settings(self._current_settings)
+
+    def _selected_glossary_path(self):
+        item = self._glossary_list.currentItem()
+        if item is None:
+            return None
+        value = item.data(Qt.ItemDataRole.UserRole)
+        return Path(value) if value else None
+
+    def _refresh_glossary_list(self, select_path=None):
+        previous = select_path or self._selected_glossary_path()
+        self._glossary_list.blockSignals(True)
+        self._glossary_list.clear()
+        total_entries = 0
+        loaded_files = 0
+        failed_files = 0
+        selected_row = 0
+        for row, path in enumerate(self._glossary_paths()):
+            try:
+                glossary = TermGlossary.from_file(path)
+                count = len(glossary.entries)
+                total_entries += count
+                loaded_files += 1
+                item_text = t("glossary_loaded_item").format(
+                    name=path.name, count=count
+                )
+                ready = True
+            except Exception:
+                failed_files += 1
+                item_text = t("glossary_failed_item").format(name=path.name)
+                ready = False
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.ItemDataRole.UserRole, str(path))
+            item.setData(_GLOSSARY_READY_ROLE, ready)
+            item.setToolTip(str(path))
+            self._glossary_list.addItem(item)
+            if previous is not None and path == previous:
+                selected_row = row
+        self._glossary_list.blockSignals(False)
+
+        has_glossaries = bool(self._glossary_list.count())
+        if has_glossaries:
+            self._glossary_list.setCurrentRow(selected_row)
+        else:
+            self._on_glossary_selection_changed(None, None)
+
+        enabled = (
+            self._glossary_enabled_cb.isChecked()
+            if hasattr(self, "_glossary_enabled_cb")
+            else self._current_settings.get("glossary_enabled", True)
+        )
+        if not enabled:
+            self._glossary_status.setText(
+                t("glossary_disabled_status").format(
+                    files=loaded_files,
+                    count=total_entries,
+                    failed=failed_files,
+                )
+            )
+        elif has_glossaries:
+            self._glossary_status.setText(
+                t("glossary_dynamic_status").format(
+                    files=loaded_files,
+                    count=total_entries,
+                    limit=self._config["translation"].get(
+                        "glossary_max_entries", 12
+                    ),
+                    failed=failed_files,
+                )
+            )
+        else:
+            self._glossary_status.setText(t("glossary_none_status"))
+
+    def _on_glossary_selection_changed(self, current, previous=None):
+        del previous
+        path = self._selected_glossary_path()
+        ready = bool(current and current.data(_GLOSSARY_READY_ROLE))
+        path_text = str(path) if path else ""
+        self._glossary_path_view.setText(path_text)
+        self._glossary_path_view.setToolTip(path_text)
+        self._remove_glossary_btn.setEnabled(path is not None)
+        self._open_glossary_file_btn.setEnabled(
+            bool(ready and path is not None and path.is_file())
+        )
+        self._open_glossary_folder_btn.setEnabled(
+            bool(path is not None and path.parent.is_dir())
+        )
+
+    def _save_glossary_paths(self, paths, select_path=None):
+        self._current_settings["glossary_paths"] = [str(path) for path in paths]
+        self._refresh_glossary_list(select_path)
+        self._apply_settings()
+        _save_settings(self._current_settings)
+
+    def _add_glossary(self):
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            t("dialog_add_glossary"),
+            str(Path(__file__).parent),
+            t("glossary_file_filter"),
+        )
+        if not selected:
+            return
+        path = Path(selected).resolve()
+        try:
+            glossary = TermGlossary.from_file(path)
+            if not glossary.entries:
+                raise ValueError(t("glossary_no_entries"))
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "LiveTranslate",
+                t("glossary_failed_status").format(error=str(exc)),
+            )
+            return
+        paths = self._glossary_paths()
+        if path not in paths:
+            paths.append(path)
+        self._save_glossary_paths(paths, path)
+
+    def _remove_glossary(self):
+        selected = self._selected_glossary_path()
+        if selected is None:
+            return
+        paths = [path for path in self._glossary_paths() if path != selected]
+        self._save_glossary_paths(paths)
+
+    def _reload_glossary_list(self):
+        selected = self._selected_glossary_path()
+        self._refresh_glossary_list(selected)
+        self._apply_settings()
+
+    def _open_glossary_file(self):
+        path = self._selected_glossary_path()
+        if path is None or not path.is_file():
+            QMessageBox.warning(
+                self,
+                "LiveTranslate",
+                t("glossary_path_missing").format(path=path),
+            )
+            return
+        try:
+            os.startfile(str(path))
+        except OSError as exc:
+            QMessageBox.warning(self, "LiveTranslate", str(exc))
+
+    def _open_glossary_folder(self):
+        selected = self._selected_glossary_path()
+        path = selected.parent if selected is not None else None
+        if path is None or not path.is_dir():
+            QMessageBox.warning(
+                self,
+                "LiveTranslate",
+                t("glossary_path_missing").format(path=path),
+            )
+            return
+        try:
+            os.startfile(str(path))
+        except OSError as exc:
+            QMessageBox.warning(self, "LiveTranslate", str(exc))
+
     def _on_silence_mode_changed(self, index):
         self._silence_duration.setEnabled(index == 1)
 
     def _on_vad_mode_changed(self, index):
-        modes = ["silero", "energy", "disabled"]
-        self._current_settings["vad_mode"] = modes[index]
+        modes = ["silero", "firered", "energy", "disabled"]
+        mode = modes[index]
+        self._current_settings["vad_mode"] = mode
+        self._update_vad_mode_visibility(mode)
+
+    def _update_vad_mode_visibility(self, mode: str):
+        """Show only the parameter group used by the selected VAD engine."""
+        if hasattr(self, "_silero_group"):
+            self._silero_group.setVisible(mode == "silero")
+        if hasattr(self, "_firered_group"):
+            self._firered_group.setVisible(mode == "firered")
+        if hasattr(self, "_energy_group"):
+            self._energy_group.setVisible(mode == "energy")
+        QTimer.singleShot(0, self._fit_height)
 
     def _on_threshold_changed(self, value):
         val = value / 100.0
         self._current_settings["vad_threshold"] = val
         self._vad_threshold_label.setText(f"{value}%")
         if not self._vad_threshold_slider.isSliderDown():
+            self._auto_save()
+
+    def _on_firered_threshold_changed(self, value):
+        self._current_settings["firered_threshold"] = value / 100.0
+        self._firered_threshold_label.setText(f"{value}%")
+        if not self._firered_threshold_slider.isSliderDown():
             self._auto_save()
 
     def _on_energy_changed(self, value):
@@ -1386,6 +2072,41 @@ class ControlPanel(QWidget):
         self._current_settings["silence_duration"] = round(self._silence_duration.value(), 2)
         self._current_settings["incremental_asr"] = self._incremental_asr_cb.isChecked()
         self._current_settings["interim_interval"] = round(self._interim_interval_spin.value(), 2)
+        if hasattr(self, "_firered_model_path"):
+            self._current_settings["firered_vad_model_path"] = (
+                self._firered_model_path.text().strip()
+            )
+            self._current_settings["firered_threshold"] = (
+                self._firered_threshold_slider.value() / 100.0
+            )
+            self._current_settings["firered_smooth_window"] = (
+                self._firered_smooth_window.value()
+            )
+            self._current_settings["firered_pad_start_frames"] = (
+                self._firered_pad_start_frames.value()
+            )
+            self._current_settings["firered_min_speech_frames"] = (
+                self._firered_min_speech_frames.value()
+            )
+            self._current_settings["firered_min_silence_frames"] = (
+                self._firered_min_silence_frames.value()
+            )
+        if hasattr(self, "_vad_pre_roll_ms"):
+            self._current_settings["vad_pre_roll_ms"] = (
+                self._vad_pre_roll_ms.value()
+            )
+            self._current_settings["vad_adaptive_silence_min"] = round(
+                self._vad_adaptive_min.value(), 2
+            )
+            self._current_settings["vad_adaptive_silence_max"] = round(
+                self._vad_adaptive_max.value(), 2
+            )
+            self._current_settings["vad_split_tail_guard"] = round(
+                self._vad_split_tail_guard.value(), 2
+            )
+            self._current_settings["vad_progressive_split"] = (
+                self._vad_progressive_split.isChecked()
+            )
 
     def _on_ui_lang_changed(self, index):
         lang = "en" if index == 0 else "zh"
@@ -1446,6 +2167,7 @@ class ControlPanel(QWidget):
             1: "funasr",
             2: "anime-whisper",
             3: "remote-whisper",
+            4: "qwen3-asr",
         }
         self._current_settings["asr_engine"] = engine_map.get(
             self._asr_engine.currentIndex(), "whisper"
@@ -1455,6 +2177,27 @@ class ControlPanel(QWidget):
             url = self._remote_url_edit.text().strip()
             if url:
                 self._current_settings["remote_asr_url"] = url
+        if hasattr(self, "_qwen3_model_path"):
+            for key, widget in (
+                ("qwen3_model_path", self._qwen3_model_path),
+                ("qwen3_python", self._qwen3_python),
+                ("qwen3_project", self._qwen3_project),
+            ):
+                value = widget.text().strip()
+                if value:
+                    self._current_settings[key] = value
+            self._current_settings["qwen3_context_turns"] = (
+                self._qwen3_context_turns.value()
+            )
+            self._current_settings["qwen3_max_new_tokens"] = (
+                self._qwen3_max_new_tokens.value()
+            )
+            self._current_settings["qwen3_hotwords"] = (
+                self._qwen3_hotwords.text().strip()
+            )
+            self._current_settings["qwen3_refine_enabled"] = (
+                self._qwen3_refine_enabled.isChecked()
+            )
         self._current_settings["whisper_model_size"] = (
             self._selected_whisper_model()
         )
@@ -1486,6 +2229,21 @@ class ControlPanel(QWidget):
         prompt_text = self._prompt_edit.toPlainText().strip()
         if prompt_text:
             self._current_settings["system_prompt"] = prompt_text
+        if hasattr(self, "_glossary_enabled_cb"):
+            self._current_settings["glossary_enabled"] = (
+                self._glossary_enabled_cb.isChecked()
+            )
+        if hasattr(self, "_ocr_enabled_cb"):
+            self._current_settings["ocr_enabled"] = self._ocr_enabled_cb.isChecked()
+            for key, widget in (
+                ("ocr_python", self._ocr_python_edit),
+                ("ocr_model_path", self._ocr_model_path_edit),
+                ("ocr_cache_dir", self._ocr_cache_dir_edit),
+            ):
+                self._current_settings[key] = widget.text().strip()
+            self._current_settings["ocr_device"] = (
+                self._ocr_device_combo.currentData() or "cpu"
+            )
         self._current_settings["timeout"] = self._timeout_spin.value()
         if hasattr(self, "_incremental_asr_cb"):
             self._on_timing_changed()
@@ -1505,6 +2263,14 @@ class ControlPanel(QWidget):
 
     def get_settings(self):
         return dict(self._current_settings)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.visibility_changed.emit(True)
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self.visibility_changed.emit(False)
 
     def get_active_model(self) -> dict | None:
         models = self._current_settings.get("models", [])

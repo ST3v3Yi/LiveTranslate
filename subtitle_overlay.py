@@ -1,5 +1,8 @@
 import ctypes
 import os
+import subprocess
+import time
+from ctypes import wintypes
 
 import psutil
 from i18n import t, LANGUAGES
@@ -41,6 +44,7 @@ DEFAULT_STYLE = {
     "translation_color": "#ffffff",
     "timestamp_color": "#888899",
     "window_opacity": 95,
+    "performance_scope": "application",
 }
 
 _BASE = DEFAULT_STYLE
@@ -454,10 +458,17 @@ class MonitorBar(QWidget):
         layout.addWidget(self._stats_label)
 
         self._proc = psutil.Process(os.getpid())
-        self._proc.cpu_percent(interval=None)  # Prime the counter
+        self._known_processes = {}
+        self._prime_process_cpu([self._proc])
+        psutil.cpu_percent(interval=None)
+        self._performance_scope = "application"
         self._cpu = 0
-        self._ram_mb = 0.0
+        self._ram_commit_mb = 0.0
+        self._ram_peak_mb = 0.0
+        self._ram_total_mb = 0.0
         self._gpu_text = "N/A"
+        self._gpu_tooltip = "GPU memory is unavailable."
+        self._last_gpu_sample_at = 0.0
         self._asr_device = ""
         self._asr_count = 0
         self._tl_count = 0
@@ -485,6 +496,15 @@ class MonitorBar(QWidget):
         self._asr_device = device
         self._refresh_stats()
 
+    def set_performance_scope(self, scope: str):
+        scope = scope if scope in ("application", "system") else "application"
+        if scope == self._performance_scope:
+            return
+        self._performance_scope = scope
+        self._last_gpu_sample_at = 0.0
+        psutil.cpu_percent(interval=None)
+        self._update_system()
+
     def update_pipeline_stats(
         self, asr_count, tl_count, prompt_tokens, completion_tokens, cost=0.0
     ):
@@ -495,22 +515,202 @@ class MonitorBar(QWidget):
         self._cost = cost
         self._refresh_stats()
 
-    def _update_system(self):
+    @staticmethod
+    def _format_memory(memory_mb: float) -> str:
+        if memory_mb >= 1024:
+            return f"{memory_mb / 1024:.1f}GB"
+        return f"{memory_mb:.0f}MB"
+
+    def _live_process_tree(self):
+        """Return this UI process and all live model-worker descendants."""
         try:
-            self._cpu = int(self._proc.cpu_percent(interval=None) / os.cpu_count())
-            self._ram_mb = self._proc.memory_info().rss / 1024 / 1024
-        except Exception:
+            processes = [self._proc, *self._proc.children(recursive=True)]
+        except (psutil.Error, OSError):
+            processes = [self._proc]
+
+        unique = []
+        seen = set()
+        for process in processes:
+            if process.pid in seen:
+                continue
+            seen.add(process.pid)
+            unique.append(process)
+        self._prime_process_cpu(unique)
+        return unique
+
+    def _prime_process_cpu(self, processes):
+        for process in processes:
+            if process.pid in self._known_processes:
+                continue
+            try:
+                process.cpu_percent(interval=None)
+                self._known_processes[process.pid] = process
+            except (psutil.Error, OSError):
+                continue
+
+    def _read_gpu_memory(self, pids: set[int], system_scope=False):
+        """Read app VRAM when the driver exposes it; otherwise use card total."""
+        now = time.monotonic()
+        if now - self._last_gpu_sample_at < 2.0:
+            return
+        self._last_gpu_sample_at = now
+
+        app_mb = self._windows_gpu_process_memory_mb(None if system_scope else pids)
+        if app_mb is not None:
+            self._gpu_text = self._format_memory(app_mb)
+            self._gpu_tooltip = (
+                "Dedicated VRAM used by all GPU processes."
+                if system_scope
+                else "Dedicated VRAM used by LiveTranslate and its model workers."
+            )
+            return
+
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-compute-apps=pid,used_memory",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=1.5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            app_mb = 0.0
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    parts = [part.strip() for part in line.split(",")]
+                    if len(parts) != 2:
+                        continue
+                    try:
+                        if system_scope or int(parts[0]) in pids:
+                            app_mb += float(parts[1])
+                    except ValueError:
+                        continue
+            if app_mb > 0:
+                self._gpu_text = self._format_memory(app_mb)
+                self._gpu_tooltip = "VRAM used by LiveTranslate and its model workers."
+                return
+        except (OSError, subprocess.SubprocessError):
             pass
+
+        # WDDM drivers often hide per-process VRAM from nvidia-smi. PyTorch can
+        # still report reliable card-wide used/free memory from the same driver.
         try:
             import torch
 
             if torch.cuda.is_available():
-                alloc = torch.cuda.memory_allocated() / 1024 / 1024
-                self._gpu_text = f"{alloc:.0f}MB"
-            else:
-                self._gpu_text = "N/A"
+                free_bytes, total_bytes = torch.cuda.mem_get_info()
+                used_mb = (total_bytes - free_bytes) / 1024 / 1024
+                total_mb = total_bytes / 1024 / 1024
+                self._gpu_text = (
+                    f"{self._format_memory(used_mb)}/{self._format_memory(total_mb)}"
+                )
+                self._gpu_tooltip = (
+                    "Total VRAM used on this GPU. The Windows graphics driver does "
+                    "not expose the requested process breakdown."
+                )
+                return
         except Exception:
-            self._gpu_text = "N/A"
+            pass
+        self._gpu_text = "N/A"
+        self._gpu_tooltip = "GPU memory is unavailable."
+
+    @staticmethod
+    def _windows_gpu_process_memory_mb(pids: set[int] | None):
+        """Use Task Manager's GPU Process Memory counter on Windows."""
+        if os.name != "nt":
+            return None
+        try:
+            pdh = ctypes.WinDLL("pdh")
+            query = ctypes.c_void_p()
+            if pdh.PdhOpenQueryW(None, 0, ctypes.byref(query)) != 0:
+                return None
+            try:
+                wildcard = r"\GPU Process Memory(*)\Dedicated Usage"
+                length = wintypes.DWORD(0)
+                pdh.PdhExpandWildCardPathW(
+                    None, wildcard, None, ctypes.byref(length), 0
+                )
+                if not length.value:
+                    return None
+                paths_buffer = ctypes.create_unicode_buffer(length.value)
+                if pdh.PdhExpandWildCardPathW(
+                    None, wildcard, paths_buffer, ctypes.byref(length), 0
+                ) != 0:
+                    return None
+
+                counters = []
+                for path in paths_buffer[:].split("\0"):
+                    if not path or (
+                        pids is not None
+                        and not any(f"pid_{pid}_" in path for pid in pids)
+                    ):
+                        continue
+                    counter = ctypes.c_void_p()
+                    if pdh.PdhAddEnglishCounterW(
+                        query, path, 0, ctypes.byref(counter)
+                    ) == 0:
+                        counters.append(counter)
+                if not counters or pdh.PdhCollectQueryData(query) != 0:
+                    return None
+
+                class _PdhValue(ctypes.Union):
+                    _fields_ = [("large_value", ctypes.c_longlong)]
+
+                class _PdhFormattedValue(ctypes.Structure):
+                    _fields_ = [
+                        ("status", wintypes.DWORD),
+                        ("value", _PdhValue),
+                    ]
+
+                used_bytes = 0
+                for counter in counters:
+                    value = _PdhFormattedValue()
+                    if pdh.PdhGetFormattedCounterValue(
+                        counter, 0x00000400, None, ctypes.byref(value)
+                    ) == 0 and value.status == 0:
+                        used_bytes += max(0, value.value.large_value)
+                return used_bytes / 1024 / 1024
+            finally:
+                pdh.PdhCloseQuery(query)
+        except (AttributeError, OSError):
+            return None
+
+    def _update_system(self):
+        if self._performance_scope == "system":
+            memory = psutil.virtual_memory()
+            self._cpu = psutil.cpu_percent(interval=None)
+            self._ram_commit_mb = memory.used / 1024 / 1024
+            self._ram_total_mb = memory.total / 1024 / 1024
+            self._ram_peak_mb = 0.0
+            self._read_gpu_memory(set(), system_scope=True)
+            self._refresh_stats()
+            return
+
+        processes = self._live_process_tree()
+        cpu_percent = 0.0
+        commit_mb = 0.0
+        peak_commit_mb = 0.0
+        for process in processes:
+            try:
+                cpu_percent += process.cpu_percent(interval=None)
+                memory = process.memory_info()
+                # Windows Task Manager reports a model process primarily by its
+                # committed private pages (pagefile), not its smaller RSS set.
+                pagefile = getattr(memory, "pagefile", memory.vms)
+                peak_pagefile = getattr(memory, "peak_pagefile", pagefile)
+                commit_mb += pagefile / 1024 / 1024
+                peak_commit_mb += peak_pagefile / 1024 / 1024
+            except (psutil.Error, OSError):
+                continue
+        logical_cpus = psutil.cpu_count(logical=True) or 1
+        self._cpu = max(0.0, cpu_percent / logical_cpus)
+        self._ram_commit_mb = commit_mb
+        self._ram_peak_mb = peak_commit_mb
+        self._ram_total_mb = 0.0
+        self._read_gpu_memory({process.pid for process in processes})
         self._refresh_stats()
 
     def _refresh_stats(self):
@@ -528,10 +728,21 @@ class MonitorBar(QWidget):
             from i18n import get_lang
             symbol = "¥" if get_lang() == "zh" else "$"
             cost_str = f' <span style="color:#fa5;">{symbol}{self._cost:.4f}</span>'
+        if self._performance_scope == "system":
+            ram_text = (
+                f'{self._format_memory(self._ram_commit_mb)}/'
+                f'{self._format_memory(self._ram_total_mb)}'
+            )
+            ram_detail = ""
+        else:
+            ram_text = self._format_memory(self._ram_commit_mb)
+            ram_detail = (
+                f' <span style="color:#666;">(P{self._format_memory(self._ram_peak_mb)})</span>'
+            )
         self._stats_label.setText(
             f"{dev_str}"
-            f'<span style="color:#6cf;">CPU</span> {self._cpu}% '
-            f'<span style="color:#6cf;">RAM</span> {self._ram_mb:.0f}MB '
+            f'<span style="color:#6cf;">CPU</span> {self._cpu:.1f}% '
+            f'<span style="color:#6cf;">RAM</span> {ram_text}{ram_detail} '
             f'<span style="color:#6cf;">GPU</span> {self._gpu_text} '
             f'<span style="color:#555;">|</span> '
             f'<span style="color:#8b8;">ASR</span> {self._asr_count} '
@@ -540,6 +751,17 @@ class MonitorBar(QWidget):
             f'<span style="color:#666;">({self._prompt_tokens}\u2191{self._completion_tokens}\u2193)</span>'
             f'{cost_str}'
         )
+        scope_tip = (
+            "CPU, RAM, and GPU report the entire computer.\n"
+            if self._performance_scope == "system"
+            else "CPU and RAM include the LiveTranslate interface and all local model workers.\n"
+        )
+        ram_tip = (
+            "RAM is currently used / total physical memory.\n"
+            if self._performance_scope == "system"
+            else "RAM is current committed memory; P is the peak since each worker started.\n"
+        )
+        self._stats_label.setToolTip(scope_tip + ram_tip + self._gpu_tooltip)
 
 
 class _DragArea(QWidget):
@@ -597,6 +819,7 @@ class DragHandle(QWidget):
 
     settings_clicked = pyqtSignal()
     subtitle_clicked = pyqtSignal()
+    screenshot_clicked = pyqtSignal()
     click_through_toggled = pyqtSignal(bool)
     topmost_toggled = pyqtSignal(bool)
     auto_scroll_toggled = pyqtSignal(bool)
@@ -658,6 +881,10 @@ class DragHandle(QWidget):
         self._subtitle_btn = _btn(t("subtitle"))
         self._subtitle_btn.clicked.connect(self.subtitle_clicked.emit)
         row1.addWidget(self._subtitle_btn)
+
+        self._screenshot_btn = _btn(t("screenshot"), t("screenshot_hint"))
+        self._screenshot_btn.clicked.connect(self.screenshot_clicked.emit)
+        row1.addWidget(self._screenshot_btn)
 
         self._running = False
         self._start_stop_btn = _btn(t("paused"))
@@ -864,6 +1091,7 @@ class DragHandle(QWidget):
         self._row2_widget.setVisible(not compact)
         self._clear_btn.setVisible(not compact)
         self._subtitle_btn.setVisible(not compact)
+        self._screenshot_btn.setVisible(not compact)
         self._mode_btn.setText(t("mode_compact") if compact else t("mode_full"))
         self.setFixedHeight(24 if compact else 62)
 
@@ -900,6 +1128,7 @@ class SubtitleOverlay(QWidget):
     hide_requested = pyqtSignal()
     quit_requested = pyqtSignal()
     subtitle_toggled = pyqtSignal()
+    screenshot_requested = pyqtSignal()
     mode_changed = pyqtSignal(str)  # "full" or "compact"
     position_changed = pyqtSignal()
 
@@ -962,6 +1191,7 @@ class SubtitleOverlay(QWidget):
         self._handle = DragHandle()
         self._handle.settings_clicked.connect(self.settings_requested.emit)
         self._handle.subtitle_clicked.connect(self.subtitle_toggled.emit)
+        self._handle.screenshot_clicked.connect(self.screenshot_requested.emit)
         self._handle.click_through_toggled.connect(self._set_click_through)
         self._handle.topmost_toggled.connect(self._set_topmost)
         self._handle.taskbar_toggled.connect(self._set_taskbar)
@@ -1013,8 +1243,21 @@ class SubtitleOverlay(QWidget):
         grip_row = QHBoxLayout()
         grip_row.addStretch()
         self._grip = QSizeGrip(self)
-        self._grip.setFixedSize(16, 16)
-        self._grip.setStyleSheet("background: transparent;")
+        self._grip.setFixedSize(22, 22)
+        self._grip.setCursor(QCursor(Qt.CursorShape.SizeFDiagCursor))
+        self._grip.setToolTip(t("resize_window_hint"))
+        self._grip.setStyleSheet("""
+            QSizeGrip {
+                background: rgba(255, 255, 255, 42);
+                border-top: 1px solid rgba(255, 255, 255, 70);
+                border-left: 1px solid rgba(255, 255, 255, 70);
+                border-top-left-radius: 8px;
+            }
+            QSizeGrip:hover {
+                background: rgba(100, 180, 255, 110);
+                border-color: rgba(150, 210, 255, 180);
+            }
+        """)
         grip_row.addWidget(self._grip)
         container_layout.addLayout(grip_row)
 
@@ -1081,8 +1324,13 @@ class SubtitleOverlay(QWidget):
 
         scroll_top = self._scroll.mapTo(self, QPoint(0, 0)).y()
         in_header = 0 <= local.x() <= self.width() and 0 <= local.y() < scroll_top
+        grip_pos = self._grip.mapTo(self, QPoint(0, 0))
+        in_grip = (
+            grip_pos.x() <= local.x() < grip_pos.x() + self._grip.width()
+            and grip_pos.y() <= local.y() < grip_pos.y() + self._grip.height()
+        )
 
-        if in_header:
+        if in_header or in_grip:
             if style & _WS_EX_TRANSPARENT:
                 ctypes.windll.user32.SetWindowLongW(
                     hwnd, _GWL_EXSTYLE, style & ~_WS_EX_TRANSPARENT
@@ -1199,6 +1447,7 @@ class SubtitleOverlay(QWidget):
         self._handle.setStyleSheet(f"background: {hdr_rgba}; border-radius: 4px;")
         # Window opacity
         self.setWindowOpacity(s["window_opacity"] / 100.0)
+        self._monitor.set_performance_scope(s.get("performance_scope", "application"))
         # Update all existing messages
         ChatMessage._current_style = s
         for msg in self._messages.values():
