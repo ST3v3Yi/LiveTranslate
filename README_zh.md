@@ -22,16 +22,28 @@ Windows 实时音频翻译工具。捕获系统音频（WASAPI loopback）和可
 
 - **实时翻译管线**：系统音频 → VAD → ASR → LLM 翻译 → 字幕显示
 - **多 ASR 引擎**：faster-whisper、SenseVoice、FunASR Nano、Anime-Whisper
+- **Qwen3-ASR 集成**：可选的独立 Qwen3-ASR 识别进程，支持识别上下文、专有词和二次复核
 - **远程 ASR**：通过 HTTP 把语音识别放到 GPU 机器上跑 —— 见 [REMOTE_ASR.md](REMOTE_ASR.md)
 - **兼容任意 OpenAI 格式 API**：DeepSeek、Grok、Qwen、GPT、Ollama、vLLM 等
 - **流式翻译显示**：翻译结果逐字实时显示
 - **模型独立配置**：流式传输、结构化输出(JSON)、上下文历史、禁用思考
+- **术语对照表**：加载 CSV 或 Markdown 词表，修正 ASR 专有名词，并仅将当前命中的术语注入翻译提示词
+- **截图翻译**：框选屏幕区域，在独立 OCR 进程中识别文字，预览译图后贴回、保存或复制
 - **麦克风混音**：可选将麦克风输入混合到系统音频一起识别
-- **低延迟 VAD**：32ms 音频块 + Silero VAD，自适应静音检测
+- **低延迟 VAD**：32ms 音频块 + Silero VAD，可选 FireRedVAD 流式推理
 - **透明悬浮窗**：始终置顶、鼠标穿透、可拖拽，14 种配色主题
 - **CUDA 加速**：ASR 模型 GPU 推理
 - **模型自动管理**：首次启动向导，支持 ModelScope / HuggingFace 双源
 - **内置基准测试**：对比翻译模型速度和质量
+
+## 本 Fork 的新增功能
+
+本 Fork 重点面向日语游戏、视频和直播翻译：
+
+- Qwen3-ASR 可使用最近确认的识别文本和用户填写的专有词，提高人名及短上下文语句的识别稳定性。
+- 术语模块支持自定义 CSV / Markdown 对照表，仓库内附带 `endfield_terms.csv`，作为《明日方舟：终末地》术语表示例。
+- 截图翻译支持 PaddleOCR / PaddleOCR-VL，运行在独立 Python 环境中，OCR 出错不会中断实时音频翻译。
+- ASR、OCR 和术语表均可在设置面板中配置；用户设置保存在本地 `user_settings.json`，不会提交到仓库。
 
 ## 更新日志
 
@@ -48,12 +60,12 @@ Windows 实时音频翻译工具。捕获系统音频（WASAPI loopback）和可
 
 ### 绿色版（免装 Python，推荐新手）
 
-从 [Releases](https://github.com/TheDeathDragon/LiveTranslate/releases) 下载 `LiveTranslate-portable-*.zip`，解压后双击 **`start.bat`** 即可。首次运行会自动下载便携版 Python 3.12 并按显卡安装依赖，无需预装任何 Python。
+从本 Fork 的 [Releases](https://github.com/ST3v3Yi/LiveTranslate/releases) 下载 `LiveTranslate-portable-*.zip`，解压后双击 **`start.bat`** 即可。首次运行会自动下载便携版 Python 3.12 并按显卡安装依赖，无需预装任何 Python。OCR 和 Qwen3-ASR 使用独立环境，均为可选功能。
 
 ### 从源码安装
 
 ```bash
-git clone https://github.com/TheDeathDragon/LiveTranslate.git
+git clone https://github.com/ST3v3Yi/LiveTranslate.git
 cd LiveTranslate
 ```
 
@@ -63,7 +75,7 @@ cd LiveTranslate
 3. 检测 NVIDIA 显卡，选择 CUDA / CPU 版 PyTorch
 4. 安装全部依赖
 
-安装完成后双击 **`start.bat`** 启动。
+安装完成后双击 **`start.bat`** 启动。安装脚本会将临时下载文件放在项目目录内，并在成功安装后自动清理。
 
 更新时双击 **`update.bat`**——自动拉取最新代码并更新依赖（未安装 Git 会通过 winget 自动安装）。
 
@@ -91,8 +103,17 @@ pip install -r requirements.txt
 ## 首次使用
 
 1. 弹出设置向导——选择下载源（ModelScope 适合国内，HuggingFace 适合海外）和缓存路径
-2. 自动下载 Silero VAD + SenseVoice 模型（约 1GB）
-3. 下载完成后进入主界面
+2. 自动下载 Silero VAD 和所选 ASR 模型
+3. 在模型设置中配置翻译 API
+4. 下载完成后进入主界面
+
+### 可选：Qwen3-ASR
+
+在“设置 → VAD / ASR”中选择 **Qwen3-ASR**。如果程序没有自动检测到相关环境，请填写模型目录、Qwen3-ASR 的 Python 可执行文件和源码目录。还可以配置识别上下文条数、单段最大输出、专有词提示和二次声学复核。
+
+### 可选：截图翻译
+
+在“设置 → 翻译”中启用截图翻译，并配置 PaddleOCR / PaddleOCR-VL 的 Python 可执行文件、模型目录和设备。点击悬浮窗中的 **截图翻译**，框选区域后检查译图，再选择贴回、保存或复制。OCR 在独立进程中运行，不会与实时 ASR 共用进程。
 
 ## 配置翻译 API
 
@@ -101,9 +122,11 @@ pip install -r requirements.txt
 | 参数 | 示例 |
 |------|------|
 | API Base | `https://api.deepseek.com/v1` |
-| API Key | 你的密钥 |
+| API Key | 在设置对话框中填写你自己的密钥 |
 | Model | `deepseek-chat` |
 | 代理 | `none` / `system` / 自定义地址 |
+
+仓库不包含可用的 API 密钥。请在设置对话框或本地配置中填写你自己的密钥，不要将密钥提交到 Git。
 
 ## 架构
 
@@ -121,8 +144,14 @@ main.py                 主入口，管线编排
 ├── asr_sensevoice.py   SenseVoice 后端
 ├── asr_funasr_nano.py  FunASR Nano 后端
 ├── asr_anime_whisper.py Anime-Whisper 后端 (日语动画/Galgame)
+├── asr_qwen3.py        Qwen3-ASR 进程客户端（上下文/专有词）
+├── asr_qwen3_worker.py Qwen3-ASR 工作进程
 ├── asr_remote.py        远程 Whisper 客户端 (→ asr_server.py, 见 REMOTE_ASR.md)
 ├── translator.py       OpenAI 兼容翻译客户端 (流式/JSON/上下文)
+├── term_glossary.py    CSV / Markdown 术语表加载与匹配
+├── screenshot_translation.py 截图选择与译图流程
+├── ocr_paddle.py       PaddleOCR 工作进程客户端
+├── ocr_paddle_worker.py OCR / PaddleOCR-VL 工作进程
 ├── model_manager.py    模型下载与缓存管理
 ├── subtitle_overlay.py PyQt6 透明悬浮窗
 ├── control_panel.py    设置面板 UI (7 个标签页)
@@ -139,11 +168,11 @@ main.py                 主入口，管线编排
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=TheDeathDragon%2FLiveTranslate&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=ST3v3Yi%2FLiveTranslate&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=TheDeathDragon/LiveTranslate&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=TheDeathDragon/LiveTranslate&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=TheDeathDragon/LiveTranslate&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=ST3v3Yi/LiveTranslate&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=ST3v3Yi/LiveTranslate&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=ST3v3Yi/LiveTranslate&type=date&legend=top-left" />
  </picture>
 </a>
 

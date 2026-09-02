@@ -2375,7 +2375,7 @@ def main():
         dlg = ModelEditDialog(None, {
             "name": "hunyuan-mt-chimera-7b",
             "api_base": "http://127.0.0.1:1234/v1",
-            "api_key": "sk-lm-tHzDfNGm:dgxlip7eebn3HIMxivqN",
+            "api_key": "",
             "model": "hunyuan-mt-chimera-7b",
         })
         dlg.setWindowTitle(t("setup_api_title"))
